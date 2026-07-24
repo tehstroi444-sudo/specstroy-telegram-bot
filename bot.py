@@ -113,31 +113,38 @@ def get_worksheet():
         worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
 
     if not worksheet.row_values(1):
-        worksheet.append_row(
-            [
-                "Время отправки",
-                "Дата работы",
-                "Техника",
-                "Машинист/водитель",
-                "Объект",
-                "Заказчик",
-                "Вид работы",
-                "Начало",
-                "Окончание",
-                "Часы",
-                "Вид ставки",
-                "Ставка",
-                "Рейсы",
-                "Топливо, л",
-                "Сумма, ₽",
-                "Оплата",
-                "Примечание",
-                "Кто отправил",
-                "Telegram",
-                "Chat ID",
-            ],
-            value_input_option="USER_ENTERED",
-        )
+      row_data = [
+    datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+    d["work_date"],
+    d["machine"],
+    d["driver"],
+    d["object"],
+    d["customer"],
+    d["work_type"],
+    d["start_time"],
+    d["end_time"],
+    d["hours"],
+    d["rate_type"],
+    d["rate"],
+    d["trips"],
+    d["fuel"],
+    d["amount"],
+    d["payment_status"],
+    d["note"],
+    user.full_name,
+    f"@{user.username}" if user.username else "",
+    str(update.effective_chat.id),
+]
+
+# Ищем первую свободную строку по столбцу A.
+column_a = worksheet.col_values(1)
+next_row = len(column_a) + 1
+
+worksheet.update(
+    range_name=f"A{next_row}:T{next_row}",
+    values=[row_data],
+    value_input_option="USER_ENTERED",
+)
         worksheet.freeze(rows=1)
 
     return worksheet
