@@ -61,6 +61,29 @@ WORK_TYPES = [
 RATE_TYPES = ["За час", "За смену", "За рейс", "Фиксированная"]
 PAYMENT_STATUSES = ["Оплачено", "Частично", "Не оплачено", "Отсрочка"]
 
+HEADERS = [
+    "Дата и время сохранения",
+    "Дата работы",
+    "Техника",
+    "Машинист / водитель",
+    "Объект",
+    "Заказчик",
+    "Вид работы",
+    "Начало",
+    "Окончание",
+    "Часы",
+    "Тип ставки",
+    "Ставка",
+    "Рейсы",
+    "Топливо, л",
+    "Итоговая сумма",
+    "Статус оплаты",
+    "Примечание",
+    "Пользователь Telegram",
+    "Username Telegram",
+    "Chat ID",
+]
+
 (
     MACHINE,
     DATE,
@@ -110,50 +133,42 @@ def get_worksheet():
     try:
         worksheet = spreadsheet.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
+        worksheet = spreadsheet.add_worksheet(
+            title=SHEET_NAME,
+            rows=1000,
+            cols=len(HEADERS),
+        )
 
     if not worksheet.row_values(1):
-      row_data = [
-    datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-    d["work_date"],
-    d["machine"],
-    d["driver"],
-    d["object"],
-    d["customer"],
-    d["work_type"],
-    d["start_time"],
-    d["end_time"],
-    d["hours"],
-    d["rate_type"],
-    d["rate"],
-    d["trips"],
-    d["fuel"],
-    d["amount"],
-    d["payment_status"],
-    d["note"],
-    user.full_name,
-    f"@{user.username}" if user.username else "",
-    str(update.effective_chat.id),
-]
-
-# Ищем первую свободную строку по столбцу A.
-column_a = worksheet.col_values(1)
-next_row = len(column_a) + 1
-
-worksheet.update(
-    range_name=f"A{next_row}:T{next_row}",
-    values=[row_data],
-    value_input_option="USER_ENTERED",
-)
+        worksheet.update(
+            range_name="A1:T1",
+            values=[HEADERS],
+            value_input_option="USER_ENTERED",
+        )
         worksheet.freeze(rows=1)
 
     return worksheet
 
 
+def save_report(worksheet, row_data: list[Any]) -> int:
+    column_a = worksheet.col_values(1)
+    next_row = max(len(column_a) + 1, 2)
+
+    worksheet.update(
+        range_name=f"A{next_row}:T{next_row}",
+        values=[row_data],
+        value_input_option="USER_ENTERED",
+    )
+
+    return next_row
+
+
 def inline_keyboard(values: list[str], prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(value, callback_data=f"{prefix}|{i}")]
-         for i, value in enumerate(values)]
+        [
+            [InlineKeyboardButton(value, callback_data=f"{prefix}|{i}")]
+            for i, value in enumerate(values)
+        ]
     )
 
 
@@ -423,40 +438,53 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     d = context.user_data
     user = update.effective_user
-    worksheet = get_worksheet()
-    worksheet.append_row(
-        [
-            datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-            d["work_date"],
-            d["machine"],
-            d["driver"],
-            d["object"],
-            d["customer"],
-            d["work_type"],
-            d["start_time"],
-            d["end_time"],
-            d["hours"],
-            d["rate_type"],
-            d["rate"],
-            d["trips"],
-            d["fuel"],
-            d["amount"],
-            d["payment_status"],
-            d["note"],
-            user.full_name,
-            f"@{user.username}" if user.username else "",
-            str(update.effective_chat.id),
-        ],
-        value_input_option="USER_ENTERED",
-    )
+
+    row_data = [
+        datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        d["work_date"],
+        d["machine"],
+        d["driver"],
+        d["object"],
+        d["customer"],
+        d["work_type"],
+        d["start_time"],
+        d["end_time"],
+        d["hours"],
+        d["rate_type"],
+        d["rate"],
+        d["trips"],
+        d["fuel"],
+        d["amount"],
+        d["payment_status"],
+        d["note"],
+        user.full_name,
+        f"@{user.username}" if user.username else "",
+        str(update.effective_chat.id),
+    ]
+
+    try:
+        worksheet = get_worksheet()
+        saved_row = save_report(worksheet, row_data)
+        logger.info("Отчёт записан в таблицу '%s', строка %s", SHEET_NAME, saved_row)
+    except Exception:
+        logger.exception("Не удалось записать отчёт в Google Таблицу")
+        await query.edit_message_text(
+            "❌ Не удалось записать отчёт в Google Таблицу.\n\n"
+            "Проверьте настройки Railway и журнал Deploy Logs."
+        )
+        return CONFIRM
 
     await query.edit_message_text(
-        f"✅ Отчёт сохранён.\n\n"
+        "✅ Отчёт сохранён в Google Таблицу.\n\n"
         f"Техника: {d['machine']}\n"
         f"Дата: {d['work_date']}\n"
-        f"Сумма: {d['amount']:g} ₽"
+        f"Сумма: {d['amount']:g} ₽\n"
+        f"Строка таблицы: {saved_row}"
     )
-    await query.message.reply_text("Новый отчёт можно начать кнопкой ниже.", reply_markup=main_keyboard())
+    await query.message.reply_text(
+        "Новый отчёт можно начать кнопкой ниже.",
+        reply_markup=main_keyboard(),
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
