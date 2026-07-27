@@ -101,6 +101,38 @@ HEADERS = [
     CONFIRM,
 ) = range(14)
 
+EDIT_SELECT_REPORT = 14
+EDIT_SELECT_FIELD = 15
+EDIT_VALUE = 16
+EDIT_PAYMENT = 17
+
+COL = {
+    "driver": 5,
+    "object": 6,
+    "customer": 7,
+    "start_time": 8,
+    "end_time": 9,
+    "hours": 10,
+    "rate_type": 11,
+    "rate": 12,
+    "trips": 13,
+    "amount": 14,
+    "payment_status": 15,
+    "note": 16,
+}
+
+EDIT_FIELDS = {
+    "start_time": "🕘 Время начала",
+    "end_time": "🕔 Время окончания",
+    "rate": "💰 Ставку",
+    "trips": "🚚 Количество рейсов",
+    "object": "📍 Объект",
+    "customer": "🏢 Заказчика",
+    "driver": "👷 Машиниста / водителя",
+    "payment_status": "💳 Статус оплаты",
+    "note": "📝 Примечание",
+}
+
 
 def _credentials() -> Credentials:
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -306,7 +338,10 @@ def inline_keyboard(values: list[str], prefix: str) -> InlineKeyboardMarkup:
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["Новый отчет"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [["🚜 Новый отчет", "✏️ Изменить отчет"]],
+        resize_keyboard=True,
+    )
 
 
 def parse_number(value: str) -> float:
@@ -354,6 +389,51 @@ def calculate_amount(data: dict[str, Any]) -> float:
         return round(rate_value * float(data["trips"]), 2)
 
     return round(rate_value, 2)
+
+
+def calculate_amount_values(
+    rate_type: str,
+    rate_value: float,
+    hours_value: float,
+    trips_value: float,
+) -> float:
+    if rate_type == "За час":
+        return round(rate_value * hours_value, 2)
+    if rate_type == "За рейс":
+        return round(rate_value * trips_value, 2)
+    return round(rate_value, 2)
+
+
+def pad_row(row: list[str], length: int = 20) -> list[str]:
+    return row + [""] * max(0, length - len(row))
+
+
+def report_summary(row_number: int, row: list[str]) -> str:
+    row = pad_row(row)
+    return (
+        f"Отчёт, строка {row_number}\n\n"
+        f"📅 {row[0]}\n"
+        f"🚜 {row[1]} — {row[2]}\n"
+        f"🔢 {row[3]}\n"
+        f"👷 {row[4]}\n"
+        f"📍 {row[5]}\n"
+        f"🏢 {row[6] or '—'}\n"
+        f"🕘 {row[7]}–{row[8]}\n"
+        f"⏱ {row[9]} ч.\n"
+        f"💰 {row[11]} ₽ — {row[10]}\n"
+        f"🚚 Рейсы: {row[12] or '0'}\n"
+        f"🧾 Сумма: {row[13]} ₽\n"
+        f"💳 {row[14]}\n"
+        f"📝 {row[15] or '—'}"
+    )
+
+
+def edit_fields_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"editfield|{key}")]
+        for key, label in EDIT_FIELDS.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -632,7 +712,247 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     await query.message.reply_text(
-        "Новый отчёт можно начать кнопкой ниже.",
+        "Выберите следующее действие:",
+        reply_markup=main_keyboard(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_report_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    context.user_data.clear()
+
+    try:
+        worksheet = get_worksheet()
+        rows = worksheet.get_all_values()
+    except Exception:
+        logger.exception("Не удалось загрузить отчёты")
+        await update.effective_message.reply_text(
+            "❌ Не удалось загрузить отчёты из Google Таблицы.",
+            reply_markup=main_keyboard(),
+        )
+        return ConversationHandler.END
+
+    reports = []
+    for row_number in range(len(rows), 1, -1):
+        row = pad_row(rows[row_number - 1])
+        if row[0].strip():
+            reports.append((row_number, row))
+        if len(reports) >= 20:
+            break
+
+    if not reports:
+        await update.effective_message.reply_text(
+            "В таблице пока нет отчётов для изменения.",
+            reply_markup=main_keyboard(),
+        )
+        return ConversationHandler.END
+
+    buttons = []
+    for row_number, row in reports:
+        label = f"{row[0]} | {row[2]} | {row[3]} | {row[4] or 'без водителя'}"
+        buttons.append(
+            [InlineKeyboardButton(label[:60], callback_data=f"editrow|{row_number}")]
+        )
+
+    await update.effective_message.reply_text(
+        "Выберите отчёт для изменения.\nПоказаны последние 20 отчётов:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return EDIT_SELECT_REPORT
+
+
+async def edit_report_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    row_number = int(query.data.split("|", 1)[1])
+
+    try:
+        worksheet = get_worksheet()
+        row = worksheet.row_values(row_number)
+    except Exception:
+        logger.exception("Не удалось открыть отчёт")
+        await query.edit_message_text("❌ Не удалось открыть выбранный отчёт.")
+        return ConversationHandler.END
+
+    if not row:
+        await query.edit_message_text("Этот отчёт больше не найден.")
+        return ConversationHandler.END
+
+    context.user_data["edit_row"] = row_number
+
+    await query.edit_message_text(
+        report_summary(row_number, row) + "\n\nЧто изменить?",
+        reply_markup=edit_fields_keyboard(),
+    )
+    return EDIT_SELECT_FIELD
+
+
+async def edit_field_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split("|", 1)[1]
+    context.user_data["edit_field"] = field
+
+    if field == "payment_status":
+        await query.edit_message_text(
+            "Выберите новый статус оплаты:",
+            reply_markup=inline_keyboard(PAYMENT_STATUSES, "editpayment"),
+        )
+        return EDIT_PAYMENT
+
+    prompts = {
+        "start_time": "Введите новое время начала в формате ЧЧ:ММ:",
+        "end_time": "Введите новое время окончания в формате ЧЧ:ММ:",
+        "rate": "Введите новую ставку числом:",
+        "trips": "Введите новое количество рейсов:",
+        "object": "Введите новый объект:",
+        "customer": "Введите нового заказчика или «-»:",
+        "driver": "Введите имя машиниста или водителя:",
+        "note": "Введите новое примечание или «-»:",
+    }
+
+    await query.edit_message_text(prompts[field])
+    return EDIT_VALUE
+
+
+def recalculate_row(worksheet, row_number: int) -> tuple[float, float]:
+    row = pad_row(worksheet.row_values(row_number))
+
+    hours_value = calculate_hours(row[7], row[8])
+    rate_type = row[10]
+    rate_value = parse_number(row[11] or "0")
+    trips_value = parse_number(row[12] or "0")
+    amount_value = calculate_amount_values(
+        rate_type,
+        rate_value,
+        hours_value,
+        trips_value,
+    )
+
+    worksheet.update(
+        range_name=f"J{row_number}:N{row_number}",
+        values=[[
+            hours_value,
+            rate_type,
+            rate_value,
+            trips_value,
+            amount_value,
+        ]],
+        value_input_option="USER_ENTERED",
+    )
+
+    return hours_value, amount_value
+
+
+async def edit_value_received(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    field = context.user_data.get("edit_field")
+    row_number = context.user_data.get("edit_row")
+
+    if not field or not row_number:
+        await update.message.reply_text(
+            "Сеанс изменения завершён. Нажмите «✏️ Изменить отчет» ещё раз.",
+            reply_markup=main_keyboard(),
+        )
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+
+    if field in {"start_time", "end_time"} and not valid_time(text):
+        await update.message.reply_text(
+            "Неверный формат. Введите время, например 08:00:"
+        )
+        return EDIT_VALUE
+
+    if field == "rate":
+        try:
+            value: Any = parse_number(text)
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите положительное число:")
+            return EDIT_VALUE
+    elif field == "trips":
+        try:
+            value = parse_number(text)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите число 0 или больше:")
+            return EDIT_VALUE
+    elif field in {"customer", "note"}:
+        value = "" if text == "-" else text
+    else:
+        value = text
+
+    try:
+        worksheet = get_worksheet()
+        worksheet.update_cell(row_number, COL[field], value)
+        hours_value, amount_value = recalculate_row(worksheet, row_number)
+        updated_row = worksheet.row_values(row_number)
+    except Exception:
+        logger.exception("Не удалось изменить отчёт")
+        await update.message.reply_text(
+            "❌ Не удалось изменить отчёт. Проверьте Railway Logs.",
+            reply_markup=main_keyboard(),
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "✅ Отчёт изменён.\n\n"
+        f"Рабочее время: {hours_value:g} ч.\n"
+        f"Сумма: {amount_value:g} ₽\n\n"
+        + report_summary(row_number, updated_row),
+        reply_markup=main_keyboard(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_payment_selected(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    row_number = context.user_data.get("edit_row")
+    index = int(query.data.split("|", 1)[1])
+    status = PAYMENT_STATUSES[index]
+
+    if not row_number:
+        await query.edit_message_text("Сеанс изменения завершён.")
+        return ConversationHandler.END
+
+    try:
+        worksheet = get_worksheet()
+        worksheet.update_cell(row_number, COL["payment_status"], status)
+        updated_row = worksheet.row_values(row_number)
+    except Exception:
+        logger.exception("Не удалось изменить статус оплаты")
+        await query.edit_message_text("❌ Не удалось изменить отчёт.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "✅ Статус оплаты изменён.\n\n"
+        + report_summary(row_number, updated_row)
+    )
+    await query.message.reply_text(
+        "Выберите действие:",
         reply_markup=main_keyboard(),
     )
     context.user_data.clear()
@@ -658,7 +978,14 @@ def build_application() -> Application:
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("new", start),
-            MessageHandler(filters.Regex("^Новый отчет$"), start),
+            MessageHandler(
+                filters.Regex(r"^(Новый отчет|🚜 Новый отчет)$"),
+                start,
+            ),
+            MessageHandler(
+                filters.Regex(r"^(Изменить отчет|✏️ Изменить отчет)$"),
+                edit_report_start,
+            ),
         ],
         states={
             MACHINE: [CallbackQueryHandler(machine_selected, pattern=r"^machine\|")],
@@ -675,6 +1002,21 @@ def build_application() -> Application:
             PAYMENT: [CallbackQueryHandler(payment_selected, pattern=r"^payment\|")],
             NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, note)],
             CONFIRM: [CallbackQueryHandler(confirm, pattern=r"^confirm\|")],
+            EDIT_SELECT_REPORT: [
+                CallbackQueryHandler(edit_report_selected, pattern=r"^editrow\|")
+            ],
+            EDIT_SELECT_FIELD: [
+                CallbackQueryHandler(edit_field_selected, pattern=r"^editfield\|")
+            ],
+            EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_received)
+            ],
+            EDIT_PAYMENT: [
+                CallbackQueryHandler(
+                    edit_payment_selected,
+                    pattern=r"^editpayment\|",
+                )
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
