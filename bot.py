@@ -436,6 +436,15 @@ def edit_fields_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "Выберите действие:",
+        reply_markup=main_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.effective_message.reply_text(
@@ -976,7 +985,7 @@ def build_application() -> Application:
 
     conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
+            CommandHandler("start", show_menu),
             CommandHandler("new", start),
             MessageHandler(
                 filters.Regex(r"^(Новый отчет|🚜 Новый отчет)$"),
