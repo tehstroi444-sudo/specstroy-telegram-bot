@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BOT_VERSION = "2.0-edit-report"
+
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -968,6 +970,16 @@ async def edit_payment_selected(
     return ConversationHandler.END
 
 
+async def version_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await update.effective_message.reply_text(
+        f"Версия бота: {BOT_VERSION}\n"
+        "В этой версии доступна кнопка «✏️ Изменить отчет»."
+    )
+
+
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1032,11 +1044,12 @@ def build_application() -> Application:
     )
 
     app.add_handler(conversation)
+    app.add_handler(CommandHandler("version", version_command))
     app.add_error_handler(error_handler)
     return app
 
 
 if __name__ == "__main__":
-    logger.info("Запуск Telegram-бота...")
+    logger.info("Запуск Telegram-бота. Версия: %s", BOT_VERSION)
     application = build_application()
     application.run_polling(drop_pending_updates=False)
