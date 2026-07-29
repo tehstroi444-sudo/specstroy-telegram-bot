@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.0-edit-report"
+BOT_VERSION = "3.0-multi-objects"
 
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
@@ -45,10 +45,10 @@ EQUIPMENT = [
     ("Экскаватор", "CAT 320", "9346 ХХ 50"),
     ("Экскаватор", "Hitachi 180", "1271 ХН 50"),
     ("Экскаватор", "Hitachi 200", "3149 МК 50"),
-    ("Самосвал", "MAN TGS", "У 516 МС 790"),
-    ("Самосвал", "MAN TGS", "У 496 МС 790"),
-    ("Самосвал", "MAN TGS", "Х 333 ВТ 99"),
-    ("Самосвал", "MAN TGS", "С 625 ВУ 550"),
+    ("Самосвал шоссейный", "MAN TGS", "У 516 МС 790"),
+    ("Самосвал шоссейный", "MAN TGS", "У 496 МС 790"),
+    ("Самосвал шоссейный", "MAN TGS", "Х 333 ВТ 99"),
+    ("Самосвал шоссейный", "MAN TGS", "С 625 ВУ 550"),
     ("Самосвал", "Урал NEXT", "А 677 МА 790"),
     ("Самосвал", "Урал NEXT", "А 646 МА 790"),
     ("Самосвал", "Урал NEXT", "С 873 ВС 790"),
@@ -58,9 +58,15 @@ EQUIPMENT = [
     ("Манипулятор", "КамАЗ", "В 746 КН 790"),
     ("Манипулятор", "КамАЗ", "У 695 РУ 790"),
     ("Кран", "КамАЗ", "О 437 УС 797"),
+    ("Тягач", "MAN TGS", "В 777 ЕН 150"),
 ]
 
-RATE_TYPES = ["За час", "За смену", "За рейс", "Фиксированная"]
+RATE_TYPES = ["За час", "За смену", "За рейс", "Фиксированная", "-"]
+
+MULTI_OBJECT_PLATES = {
+    "У 516 МС 790", "У 496 МС 790", "Х 333 ВТ 99",
+    "С 625 ВУ 550", "В 777 ЕН 150",
+}
 PAYMENT_STATUSES = ["Оплачено", "Частично", "Не оплачено", "Отсрочка"]
 
 HEADERS = [
@@ -84,6 +90,20 @@ HEADERS = [
     "Пользователь Telegram",
     "Username Telegram",
     "Chat ID",
+    "Ставка за рейс — объект 1, ₽",
+    "Рейсы — объект 1",
+    "Объект 2",
+    "Заказчик 2",
+    "Ставка за рейс — объект 2, ₽",
+    "Рейсы — объект 2",
+    "Объект 3",
+    "Заказчик 3",
+    "Ставка за рейс — объект 3, ₽",
+    "Рейсы — объект 3",
+    "Объект 4",
+    "Заказчик 4",
+    "Ставка за рейс — объект 4, ₽",
+    "Рейсы — объект 4",
 ]
 
 (
@@ -101,12 +121,17 @@ HEADERS = [
     PAYMENT,
     NOTE,
     CONFIRM,
-) = range(14)
+    MULTI_COUNT,
+    MULTI_OBJECT,
+    MULTI_CUSTOMER,
+    MULTI_RATE,
+    MULTI_TRIPS,
+) = range(19)
 
-EDIT_SELECT_REPORT = 14
-EDIT_SELECT_FIELD = 15
-EDIT_VALUE = 16
-EDIT_PAYMENT = 17
+EDIT_SELECT_REPORT = 19
+EDIT_SELECT_FIELD = 20
+EDIT_VALUE = 21
+EDIT_PAYMENT = 22
 
 COL = {
     "driver": 5,
@@ -163,7 +188,9 @@ def format_worksheet(worksheet) -> None:
     sheet_id = worksheet.id
     widths = [
         105, 180, 135, 125, 165, 210, 180, 85, 85, 125,
-        120, 105, 75, 110, 125, 220, 155, 170, 150, 125,
+        120, 105, 90, 110, 125, 220, 155, 170, 150, 125,
+        135, 90, 210, 180, 135, 90, 210, 180, 135, 90,
+        210, 180, 135, 90,
     ]
 
     requests = [
@@ -267,8 +294,11 @@ def get_worksheet():
             cols=len(HEADERS),
         )
 
+    if worksheet.col_count < len(HEADERS):
+        worksheet.resize(cols=len(HEADERS))
+
     worksheet.update(
-        range_name="A1:T1",
+        range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(HEADERS))}",
         values=[HEADERS],
         value_input_option="USER_ENTERED",
     )
@@ -292,12 +322,12 @@ def first_empty_row(worksheet) -> int:
 def save_report(worksheet, row_data: list[Any]) -> int:
     row_number = first_empty_row(worksheet)
     worksheet.update(
-        range_name=f"A{row_number}:T{row_number}",
+        range_name=f"A{row_number}:{gspread.utils.rowcol_to_a1(row_number, len(HEADERS))}",
         values=[row_data],
         value_input_option="USER_ENTERED",
     )
     worksheet.format(
-        f"A{row_number}:T{row_number}",
+        f"A{row_number}:{gspread.utils.rowcol_to_a1(row_number, len(HEADERS))}",
         {
             "verticalAlignment": "MIDDLE",
             "wrapStrategy": "WRAP",
@@ -381,15 +411,20 @@ def calculate_hours(start: str, end: str) -> float:
     return round(max(0, minutes - 60) / 60, 2)
 
 
-def calculate_amount(data: dict[str, Any]) -> float:
+def calculate_amount(data: dict[str, Any]) -> float | str:
+    if data.get("multi_amount") is not None:
+        return data["multi_amount"]
+    if data.get("rate") == "-" or data.get("rate_type") == "-":
+        return "-"
     rate_value = float(data.get("rate", 0))
-
     if data["rate_type"] == "За час":
+        if data.get("hours") == "-":
+            return "-"
         return round(rate_value * float(data["hours"]), 2)
-
     if data["rate_type"] == "За рейс":
+        if data.get("trips") == "-":
+            return "-"
         return round(rate_value * float(data["trips"]), 2)
-
     return round(rate_value, 2)
 
 
@@ -406,7 +441,7 @@ def calculate_amount_values(
     return round(rate_value, 2)
 
 
-def pad_row(row: list[str], length: int = 20) -> list[str]:
+def pad_row(row: list[str], length: int = len(HEADERS)) -> list[str]:
     return row + [""] * max(0, length - len(row))
 
 
@@ -511,8 +546,87 @@ async def date_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def driver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["driver"] = update.message.text.strip()
+    if context.user_data.get("plate") in MULTI_OBJECT_PLATES:
+        await update.message.reply_text(
+            "Сколько объектов было у машины? Введите число от 1 до 4:"
+        )
+        return MULTI_COUNT
     await update.message.reply_text("📍 Введите адрес или название объекта:")
     return OBJECT
+
+
+async def multi_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        count = int(update.message.text.strip())
+        if count < 1 or count > 4:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введите целое число от 1 до 4:")
+        return MULTI_COUNT
+    context.user_data["object_count"] = count
+    context.user_data["objects"] = []
+    context.user_data["current_object"] = {}
+    await update.message.reply_text("📍 Введите объект 1:")
+    return MULTI_OBJECT
+
+
+async def multi_object(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["current_object"] = {"object": update.message.text.strip()}
+    await update.message.reply_text("🏢 Введите заказчика для этого объекта или «-»:")
+    return MULTI_CUSTOMER
+
+
+async def multi_customer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["current_object"]["customer"] = "" if text == "-" else text
+    await update.message.reply_text("💰 Введите ставку за рейс для этого объекта или «-»:")
+    return MULTI_RATE
+
+
+async def multi_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "-":
+        value = "-"
+    else:
+        try:
+            value = parse_number(text)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите число или «-»:")
+            return MULTI_RATE
+    context.user_data["current_object"]["rate"] = value
+    await update.message.reply_text("🚚 Введите количество рейсов по этому объекту:")
+    return MULTI_TRIPS
+
+
+async def multi_trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        trips_value = parse_number(update.message.text.strip())
+        if trips_value < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введите число 0 или больше:")
+        return MULTI_TRIPS
+    current = context.user_data["current_object"]
+    current["trips"] = trips_value
+    context.user_data["objects"].append(current)
+    index = len(context.user_data["objects"])
+    if index < context.user_data["object_count"]:
+        context.user_data["current_object"] = {}
+        await update.message.reply_text(f"📍 Введите объект {index + 1}:")
+        return MULTI_OBJECT
+    objects = context.user_data["objects"]
+    context.user_data["object"] = objects[0]["object"]
+    context.user_data["customer"] = objects[0]["customer"]
+    context.user_data["trips"] = sum(float(item["trips"]) for item in objects)
+    context.user_data["multi_amount"] = round(sum(
+        (float(item["rate"]) * float(item["trips"]))
+        if item["rate"] != "-" else 0
+        for item in objects
+    ), 2)
+    await update.message.reply_text("🕘 Время начала работы или «-»:")
+    return START_TIME
 
 
 async def object_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -531,35 +645,37 @@ async def customer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
 
-    if not valid_time(text):
+    if text != "-" and not valid_time(text):
         await update.message.reply_text(
-            "Введите время в формате ЧЧ:ММ, например 08:00:"
+            "Введите время в формате ЧЧ:ММ, например 08:00, или «-»:"
         )
         return START_TIME
 
     context.user_data["start_time"] = text
-    await update.message.reply_text("🕔 Время окончания работы, например 17:00:")
+    await update.message.reply_text("🕔 Время окончания работы, например 17:00, или «-»:")
     return END_TIME
 
 
 async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
 
-    if not valid_time(text):
+    if text != "-" and not valid_time(text):
         await update.message.reply_text(
-            "Введите время в формате ЧЧ:ММ, например 17:00:"
+            "Введите время в формате ЧЧ:ММ, например 17:00, или «-»:"
         )
         return END_TIME
 
     context.user_data["end_time"] = text
-    context.user_data["hours"] = calculate_hours(
-        context.user_data["start_time"],
-        text,
-    )
+    start_value = context.user_data["start_time"]
+    if start_value == "-" or text == "-":
+        context.user_data["hours"] = "-"
+        hours_text = "-"
+    else:
+        context.user_data["hours"] = calculate_hours(start_value, text)
+        hours_text = f"{context.user_data['hours']:g} ч. (обед 1 час вычтен)"
 
     await update.message.reply_text(
-        f"Рабочее время с вычетом 1 часа обеда: "
-        f"{context.user_data['hours']:g} ч.\n"
+        f"Рабочее время: {hours_text}\n"
         "Выберите вид ставки:",
         reply_markup=inline_keyboard(RATE_TYPES, "rate"),
     )
@@ -575,37 +691,49 @@ async def rate_type_selected(
 
     index = int(query.data.split("|", 1)[1])
     context.user_data["rate_type"] = RATE_TYPES[index]
-
-    await query.edit_message_text("💰 Введите ставку числом, например 6000:")
+    if context.user_data["rate_type"] == "-":
+        context.user_data["rate"] = "-"
+        if context.user_data.get("plate") in MULTI_OBJECT_PLATES:
+            await query.edit_message_text("💳 Выберите статус оплаты:", reply_markup=inline_keyboard(PAYMENT_STATUSES, "payment"))
+            return PAYMENT
+        await query.edit_message_text("🚚 Количество рейсов или «-»:")
+        return TRIPS
+    await query.edit_message_text("💰 Введите ставку числом, например 6000, или «-»:")
     return RATE
 
 
 async def rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        value = parse_number(update.message.text)
-        if value <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(
-            "Введите положительное число, например 6000:"
-        )
-        return RATE
-
+    text = update.message.text.strip()
+    if text == "-":
+        value = "-"
+    else:
+        try:
+            value = parse_number(text)
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите положительное число или «-»:")
+            return RATE
     context.user_data["rate"] = value
-    await update.message.reply_text(
-        "🚚 Количество рейсов. Если нет — отправьте 0:"
-    )
+    if context.user_data.get("plate") in MULTI_OBJECT_PLATES:
+        await update.message.reply_text("💳 Выберите статус оплаты:", reply_markup=inline_keyboard(PAYMENT_STATUSES, "payment"))
+        return PAYMENT
+    await update.message.reply_text("🚚 Количество рейсов или «-»:")
     return TRIPS
 
 
 async def trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        value = parse_number(update.message.text)
-        if value < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число 0 или больше:")
-        return TRIPS
+    text = update.message.text.strip()
+    if text == "-":
+        value = "-"
+    else:
+        try:
+            value = parse_number(text)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите число 0 или больше либо «-»:")
+            return TRIPS
 
     context.user_data["trips"] = value
     await update.message.reply_text(
@@ -647,14 +775,23 @@ async def note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"📍 {d['object']}\n"
         f"🏢 {d['customer'] or '—'}\n"
         f"🕘 {d['start_time']}–{d['end_time']}\n"
-        f"⏱ Рабочее время: {d['hours']:g} ч. "
-        f"(обед 1 час вычтен)\n"
-        f"💰 {d['rate']:g} ₽ — {d['rate_type']}\n"
-        f"🚚 Рейсы: {d['trips']:g}\n"
+        f"⏱ Рабочее время: {d['hours']} ч.\n"
+        f"💰 {d['rate']} ₽ — {d['rate_type']}\n"
+        f"🚚 Рейсы всего: {d['trips']}\n"
         f"💳 {d['payment_status']}\n"
-        f"🧾 Итог: {d['amount']:g} ₽\n"
+        f"🧾 Итог: {d['amount']} ₽\n"
         f"📝 {d['note'] or '—'}"
     )
+
+    if d.get("objects"):
+        details = []
+        for i, item in enumerate(d["objects"], start=1):
+            details.append(
+                f"\nОбъект {i}: {item['object']} | "
+                f"заказчик: {item['customer'] or '—'} | "
+                f"ставка/рейс: {item['rate']} ₽ | рейсов: {item['trips']}"
+            )
+        summary += "".join(details)
 
     await update.message.reply_text(
         summary,
@@ -700,6 +837,16 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"@{user.username}" if user.username else "",
         str(update.effective_chat.id),
     ]
+    objects = d.get("objects", [])
+    for i in range(4):
+        item = objects[i] if i < len(objects) else {}
+        if i == 0:
+            row_data.extend([item.get("rate", ""), item.get("trips", "")])
+        else:
+            row_data.extend([
+                item.get("object", ""), item.get("customer", ""),
+                item.get("rate", ""), item.get("trips", ""),
+            ])
 
     try:
         worksheet = get_worksheet()
@@ -717,8 +864,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Техника: {d['equipment_name']} {d['equipment_model']}\n"
         f"Гос. номер: {d['plate']}\n"
         f"Дата: {d['work_date']}\n"
-        f"Рабочее время: {d['hours']:g} ч.\n"
-        f"Сумма: {d['amount']:g} ₽\n"
+        f"Рабочее время: {d['hours']} ч.\n"
+        f"Сумма: {d['amount']} ₽\n"
         f"Строка таблицы: {saved_row}"
     )
 
@@ -838,32 +985,43 @@ async def edit_field_selected(
     return EDIT_VALUE
 
 
-def recalculate_row(worksheet, row_number: int) -> tuple[float, float]:
+def recalculate_row(worksheet, row_number: int) -> tuple[Any, Any]:
     row = pad_row(worksheet.row_values(row_number))
 
-    hours_value = calculate_hours(row[7], row[8])
-    rate_type = row[10]
-    rate_value = parse_number(row[11] or "0")
-    trips_value = parse_number(row[12] or "0")
-    amount_value = calculate_amount_values(
-        rate_type,
-        rate_value,
-        hours_value,
-        trips_value,
-    )
+    if row[7] == "-" or row[8] == "-" or not valid_time(row[7]) or not valid_time(row[8]):
+        hours_value: Any = "-"
+    else:
+        hours_value = calculate_hours(row[7], row[8])
 
-    worksheet.update(
-        range_name=f"J{row_number}:N{row_number}",
-        values=[[
-            hours_value,
-            rate_type,
-            rate_value,
-            trips_value,
-            amount_value,
-        ]],
-        value_input_option="USER_ENTERED",
-    )
+    if row[3] in MULTI_OBJECT_PLATES:
+        pairs = [(20, 21), (24, 25), (28, 29), (32, 33)]
+        total = 0.0
+        has_rate = False
+        for rate_i, trips_i in pairs:
+            rate_text = row[rate_i] if rate_i < len(row) else ""
+            trips_text = row[trips_i] if trips_i < len(row) else ""
+            if rate_text and rate_text != "-" and trips_text and trips_text != "-":
+                total += parse_number(rate_text) * parse_number(trips_text)
+                has_rate = True
+        amount_value: Any = round(total, 2) if has_rate else "-"
+    else:
+        rate_type = row[10]
+        rate_text = row[11]
+        trips_text = row[12]
+        if rate_type == "-" or rate_text == "-" or not rate_text:
+            amount_value = "-"
+        else:
+            rate_value = parse_number(rate_text)
+            trips_value = 0 if trips_text in {"", "-"} else parse_number(trips_text)
+            if rate_type == "За час" and hours_value == "-":
+                amount_value = "-"
+            else:
+                amount_value = calculate_amount_values(
+                    rate_type, rate_value, float(hours_value) if hours_value != "-" else 0, trips_value
+                )
 
+    worksheet.update_cell(row_number, 10, hours_value)
+    worksheet.update_cell(row_number, 14, amount_value)
     return hours_value, amount_value
 
 
@@ -883,28 +1041,34 @@ async def edit_value_received(
 
     text = update.message.text.strip()
 
-    if field in {"start_time", "end_time"} and not valid_time(text):
+    if field in {"start_time", "end_time"} and text != "-" and not valid_time(text):
         await update.message.reply_text(
             "Неверный формат. Введите время, например 08:00:"
         )
         return EDIT_VALUE
 
     if field == "rate":
-        try:
-            value: Any = parse_number(text)
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Введите положительное число:")
-            return EDIT_VALUE
+        if text == "-":
+            value: Any = "-"
+        else:
+            try:
+                value = parse_number(text)
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Введите положительное число или «-»:")
+                return EDIT_VALUE
     elif field == "trips":
-        try:
-            value = parse_number(text)
-            if value < 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Введите число 0 или больше:")
-            return EDIT_VALUE
+        if text == "-":
+            value = "-"
+        else:
+            try:
+                value = parse_number(text)
+                if value < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("Введите число 0 или больше либо «-»:")
+                return EDIT_VALUE
     elif field in {"customer", "note"}:
         value = "" if text == "-" else text
     else:
@@ -976,7 +1140,7 @@ async def version_command(
 ) -> None:
     await update.effective_message.reply_text(
         f"Версия бота: {BOT_VERSION}\n"
-        "В этой версии доступна кнопка «✏️ Изменить отчет»."
+        "Поддерживаются до 4 объектов и отдельные ставки за рейс."
     )
 
 
@@ -1013,6 +1177,11 @@ def build_application() -> Application:
             DATE: [CallbackQueryHandler(date_selected, pattern=r"^date\|")],
             DATE_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_manual)],
             DRIVER: [MessageHandler(filters.TEXT & ~filters.COMMAND, driver)],
+            MULTI_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, multi_count)],
+            MULTI_OBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, multi_object)],
+            MULTI_CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, multi_customer)],
+            MULTI_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, multi_rate)],
+            MULTI_TRIPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, multi_trips)],
             OBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, object_name)],
             CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, customer)],
             START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
