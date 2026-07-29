@@ -1043,8 +1043,11 @@ def build_application() -> Application:
         allow_reentry=True,
     )
 
-    app.add_handler(conversation)
-    app.add_handler(CommandHandler("version", version_command))
+    # Служебная команда регистрируется в отдельной приоритетной группе,
+    # чтобы она работала даже во время незавершённого диалога.
+    app.add_handler(CommandHandler("version", version_command), group=-1)
+
+    app.add_handler(conversation, group=0)
     app.add_error_handler(error_handler)
     return app
 
