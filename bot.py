@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.0.1-startup-fix"
+BOT_VERSION = "5.1-assigned-drivers-quota"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -36,6 +36,7 @@ SHEET_DUMP = "Самосвалы"
 SHEET_OSAGO = "ОСАГО"
 SHEET_DIAG = "Диагностические карты"
 SHEET_REFS = "Справочники"
+SHEET_DRIVER_MAP = "Водители техники"
 
 SPECIAL_EQUIPMENT = [
     ("Экскаватор-погрузчик", "CAT 434E №1", "3151 МК 50"),
@@ -163,6 +164,30 @@ DIAG_HEADERS = [
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_COLUMNS = {"drivers": 1, "objects": 2, "customers": 3}
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
+
+DEFAULT_DRIVER_ROWS = [
+    ("CAT 434E №1", "3151 МК 50", "Сайдаев М.", "Да"),
+    ("CAT 434E №3", "6314 ХЕ 50", "Сахиб Иргали", "Да"),
+    ("CAT 434E №4", "1273 ХН 50", "Харитов Виталий", "Да"),
+    ("CAT 444 №6", "5945 ХТ 50", "Нурматов Богдан", "Да"),
+    ("CAT 330", "5106 ХХ 50", "Напрушкин Антон", "Да"),
+    ("CAT 320", "9346 ХХ 50", "Гулуцу Виталий", "Да"),
+    ("Hitachi 180", "1271 ХН 50", "Ситдиков Денис", "Да"),
+    ("Урал NEXT", "А 646 МА 790", "Дроботенко Михаил", "Да"),
+    ("Урал NEXT", "А 677 МА 790", "Турсунов Фарход", "Да"),
+    ("Урал NEXT", "С 873 ВС 790", "Абезбаев Зафар", "Да"),
+    ("КамАЗ", "У 695 РУ 790", "Храмков Влад", "Да"),
+    ("КамАЗ", "О 437 УС 797", "Веселов Михаил", "Да"),
+    ("MAN TGS", "У 516 МС 790", "Изотов Артем", "Да"),
+    ("MAN TGS", "У 496 МС 790", "Рыжов Олег", "Да"),
+    ("MAN TGS", "Х 333 ВТ 99", "Манаенков Алексей", "Да"),
+    ("MAN TGS", "С 625 ВУ 550", "Лобов Михаил", "Да"),
+    ("MAN TGS", "В 777 ЕН 150", "Нестеров Сергей", "Да"),
+]
+DRIVER_MAP_HEADERS = ["Модель", "Гос. номер", "Водитель", "Основной"]
+_SHEET_CACHE = None
+_REF_CACHE = {"drivers": None, "objects": None, "customers": None}
+_DRIVER_CACHE = {}
 
 
 def creds() -> Credentials:
@@ -322,7 +347,11 @@ def setup_dashboard(ws, kind: str) -> None:
     )
 
 
-def initialize_sheets():
+def initialize_sheets(force: bool = False):
+    global _SHEET_CACHE
+    if _SHEET_CACHE is not None and not force:
+        return _SHEET_CACHE
+
     sp = book()
     titles = [ws.title for ws in sp.worksheets()]
     if "Отчеты" in titles and SHEET_SPECIAL not in titles:
@@ -333,12 +362,34 @@ def initialize_sheets():
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     refs = ensure_sheet(sp, SHEET_REFS, REF_HEADERS, 500)
+    driver_map = ensure_sheet(sp, SHEET_DRIVER_MAP, DRIVER_MAP_HEADERS, 300)
 
+    # Тяжёлое оформление выполняется только один раз за запуск процесса.
     setup_document_sheet(osago, "osago")
     setup_dashboard(osago, "osago")
     setup_document_sheet(diag, "diag")
     setup_dashboard(diag, "diag")
-    return special, dump, refs
+
+    if len(driver_map.get_all_values()) <= 1:
+        driver_map.update(
+            f"A2:D{len(DEFAULT_DRIVER_ROWS)+1}",
+            [list(row) for row in DEFAULT_DRIVER_ROWS],
+            value_input_option="USER_ENTERED",
+        )
+
+    # Добавляем водителей в общий справочник одним пакетным запросом, без дублей.
+    existing = {normalize(v) for v in refs.col_values(1)[1:] if v.strip()}
+    missing = [[row[2]] for row in DEFAULT_DRIVER_ROWS if normalize(row[2]) not in existing]
+    if missing:
+        first = first_empty_row(refs, 1)
+        refs.update(
+            f"A{first}:A{first+len(missing)-1}",
+            missing,
+            value_input_option="USER_ENTERED",
+        )
+
+    _SHEET_CACHE = (special, dump, refs, driver_map)
+    return _SHEET_CACHE
 
 
 def first_empty_row(ws, column: int = 1) -> int:
@@ -361,10 +412,14 @@ def normalize(value: str) -> str:
 
 
 def ref_values(kind: str) -> list[str]:
-    _, _, refs = initialize_sheets()
+    cached = _REF_CACHE.get(kind)
+    if cached is not None:
+        return list(cached)
+    _, _, refs, _ = initialize_sheets()
     col = REF_COLUMNS[kind]
-    values = refs.col_values(col)[1:]
-    return [v.strip() for v in values if v.strip()]
+    values = [v.strip() for v in refs.col_values(col)[1:] if v.strip()]
+    _REF_CACHE[kind] = values
+    return list(values)
 
 
 def add_ref(kind: str, value: str) -> tuple[bool, str]:
@@ -374,10 +429,11 @@ def add_ref(kind: str, value: str) -> tuple[bool, str]:
     values = ref_values(kind)
     if normalize(value) in {normalize(v) for v in values}:
         return False, "Такая запись уже существует."
-    _, _, refs = initialize_sheets()
+    _, _, refs, _ = initialize_sheets()
     col = REF_COLUMNS[kind]
     row = first_empty_row(refs, col)
     refs.update_cell(row, col, value)
+    _REF_CACHE[kind] = None
     return True, value
 
 
@@ -385,15 +441,61 @@ def delete_ref(kind: str, index: int) -> str:
     values = ref_values(kind)
     if index < 0 or index >= len(values):
         raise ValueError("Запись не найдена")
-    _, _, refs = initialize_sheets()
+    _, _, refs, _ = initialize_sheets()
     col = REF_COLUMNS[kind]
     target = values[index]
     column_values = refs.col_values(col)
     for row, item in enumerate(column_values[1:], start=2):
         if normalize(item) == normalize(target):
             refs.update_cell(row, col, "")
+            _REF_CACHE[kind] = None
             return target
     raise ValueError("Запись не найдена")
+
+
+def drivers_for_plate(plate: str) -> list[tuple[str, bool]]:
+    if plate in _DRIVER_CACHE:
+        return list(_DRIVER_CACHE[plate])
+    _, _, _, driver_map = initialize_sheets()
+    rows = driver_map.get_all_values()[1:]
+    result = []
+    for row in rows:
+        if len(row) >= 3 and normalize(row[1]) == normalize(plate):
+            result.append((row[2].strip(), len(row) > 3 and normalize(row[3]) == normalize("Да")))
+    result.sort(key=lambda x: (not x[1], x[0]))
+    _DRIVER_CACHE[plate] = result
+    return list(result)
+
+
+def add_driver_for_plate(model: str, plate: str, driver: str, primary: bool = False) -> tuple[bool, str]:
+    driver = " ".join(driver.strip().split())
+    if not driver:
+        return False, "Пустое имя нельзя добавить."
+    existing = drivers_for_plate(plate)
+    if normalize(driver) in {normalize(x[0]) for x in existing}:
+        return False, "Этот водитель уже привязан к технике."
+    _, _, _, driver_map = initialize_sheets()
+    row = first_empty_row(driver_map, 1)
+    driver_map.update(
+        f"A{row}:D{row}",
+        [[model, plate, driver, "Да" if primary or not existing else "Нет"]],
+        value_input_option="USER_ENTERED",
+    )
+    _DRIVER_CACHE.pop(plate, None)
+    add_ref("drivers", driver)
+    return True, driver
+
+
+async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data
+    assigned = drivers_for_plate(d["plate"])
+    rows = []
+    for index, (name, primary) in enumerate(assigned):
+        label = f"✅ {name}" if primary else name
+        rows.append([InlineKeyboardButton(label, callback_data=f"machdriver|{index}")])
+    rows.append([InlineKeyboardButton("👷 Выбрать из общего списка", callback_data="driverother|0")])
+    rows.append([InlineKeyboardButton("➕ Добавить водителя для этой техники", callback_data="driveraddmachine|0")])
+    await message.reply_text("Выберите водителя для этой техники:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 def number_or_dash(text: str) -> float | str:
@@ -605,10 +707,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if parts[1] == "0":
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
             await q.edit_message_text("Дата выбрана.")
-            await ask_ref(q.message, context, "drivers", "driver")
+            await ask_machine_driver(q.message, context)
         else:
             d["step"] = "date_manual"
             await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:")
+    elif action == "machdriver":
+        assigned = drivers_for_plate(d["plate"])
+        d["driver"] = assigned[int(parts[1])][0]
+        d["step"] = "start_time"
+        await q.edit_message_text(f"Выбран водитель: {d['driver']}")
+        await q.message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
+    elif action == "driverother":
+        await q.edit_message_text("Выберите водителя из общего списка.")
+        await ask_ref(q.message, context, "drivers", "driver")
+    elif action == "driveraddmachine":
+        d["step"] = "add_machine_driver"
+        await q.edit_message_text(
+            f"Введите имя нового водителя для {d['model']} — {d['plate']}:"
+        )
     elif action == "ratetype":
         d["rate_type"] = RATE_TYPES[int(parts[1])]
         if d["rate_type"] == "За рейс":
@@ -710,7 +826,17 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "date_manual":
             datetime.strptime(value, "%d.%m.%Y")
             d["work_date"] = value
-            await ask_ref(update.message, context, "drivers", "driver")
+            await ask_machine_driver(update.message, context)
+        elif step == "add_machine_driver":
+            ok, result = add_driver_for_plate(d["model"], d["plate"], value)
+            if not ok:
+                await update.message.reply_text(result)
+                return
+            d["driver"] = result
+            d["step"] = "start_time"
+            await update.message.reply_text(
+                f"✅ Водитель добавлен и выбран: {result}\nВведите время начала ЧЧ:ММ или «-»:"
+            )
         elif step == "start_time":
             if not valid_time(value):
                 raise ValueError("Неверное время")
@@ -775,7 +901,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "edit_command":
             col_s, new_value = value.split("=", 1)
             col = int(col_s)
-            special, dump, _ = initialize_sheets()
+            special, dump, _, _ = initialize_sheets()
             ws = special if d["edit_sheet"] == "special" else dump
             ws.update_cell(d["edit_row"], col, new_value.strip())
             await update.message.reply_text("✅ Ячейка изменена.", reply_markup=menu())
@@ -842,7 +968,7 @@ def summary(d):
 
 async def save_current_report(q, context):
     d = context.user_data
-    special, dump, _ = initialize_sheets()
+    special, dump, _, _ = initialize_sheets()
     user = q.from_user
     if d["category"] == "special":
         row = [
@@ -932,7 +1058,7 @@ async def edit_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_edit_rows(q, context, sheet_code):
     context.user_data["edit_sheet"] = sheet_code
-    special, dump, _ = initialize_sheets()
+    special, dump, _, _ = initialize_sheets()
     ws = special if sheet_code == "special" else dump
     rows = ws.get_all_values()
     keyboard = []
