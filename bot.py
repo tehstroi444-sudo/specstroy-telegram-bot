@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.0-directories-documents"
+BOT_VERSION = "5.0.1-startup-fix"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -295,7 +295,10 @@ def setup_dashboard(ws, kind: str) -> None:
     else:
         start_col, status_col = "M", "J"
     start_num = gspread.utils.a1_to_rowcol(start_col + "1")[1]
-    end_col = col_letter(start_num + 1)
+    required_cols = start_num + 1
+    if ws.col_count < required_cols:
+        ws.add_cols(required_cols - ws.col_count)
+    end_col = col_letter(required_cols)
     ws.update(
         f"{start_col}1:{end_col}5",
         [
@@ -327,8 +330,8 @@ def initialize_sheets():
 
     special = ensure_sheet(sp, SHEET_SPECIAL, SPECIAL_HEADERS)
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
-    osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 500)
-    diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 500)
+    osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
+    diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     refs = ensure_sheet(sp, SHEET_REFS, REF_HEADERS, 500)
 
     setup_document_sheet(osago, "osago")
