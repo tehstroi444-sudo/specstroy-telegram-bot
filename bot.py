@@ -13,7 +13,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -25,15 +24,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "3.2-final-multi-objects"
+BOT_VERSION = "5.0-directories-documents"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
     "1LLEE79yZpd2o-vBXDz0Z_uHx97lgR_Eo",
 )
-SHEET_NAME = os.getenv("SHEET_NAME", "Отчеты")
 
-EQUIPMENT = [
+SHEET_SPECIAL = "Спецтехника"
+SHEET_DUMP = "Самосвалы"
+SHEET_OSAGO = "ОСАГО"
+SHEET_DIAG = "Диагностические карты"
+SHEET_REFS = "Справочники"
+
+SPECIAL_EQUIPMENT = [
     ("Экскаватор-погрузчик", "CAT 434E №1", "3151 МК 50"),
     ("Экскаватор-погрузчик", "CAT 434E №3", "6314 ХЕ 50"),
     ("Экскаватор-погрузчик", "CAT 434E №4", "1273 ХН 50"),
@@ -44,10 +48,6 @@ EQUIPMENT = [
     ("Экскаватор", "CAT 320", "9346 ХХ 50"),
     ("Экскаватор", "Hitachi 180", "1271 ХН 50"),
     ("Экскаватор", "Hitachi 200", "3149 МК 50"),
-    ("Самосвал шоссейный", "MAN TGS", "У 516 МС 790"),
-    ("Самосвал шоссейный", "MAN TGS", "У 496 МС 790"),
-    ("Самосвал шоссейный", "MAN TGS", "Х 333 ВТ 99"),
-    ("Самосвал шоссейный", "MAN TGS", "С 625 ВУ 550"),
     ("Самосвал", "Урал NEXT", "А 677 МА 790"),
     ("Самосвал", "Урал NEXT", "А 646 МА 790"),
     ("Самосвал", "Урал NEXT", "С 873 ВС 790"),
@@ -57,41 +57,34 @@ EQUIPMENT = [
     ("Манипулятор", "КамАЗ", "В 746 КН 790"),
     ("Манипулятор", "КамАЗ", "У 695 РУ 790"),
     ("Кран", "КамАЗ", "О 437 УС 797"),
-    ("Тягач", "MAN TGS", "В 777 ЕН 150"),
 ]
 
-MULTI_OBJECT_PLATES = {
-    "У 516 МС 790",
-    "У 496 МС 790",
-    "Х 333 ВТ 99",
-    "С 625 ВУ 550",
-    "В 777 ЕН 150",
-}
+DUMP_EQUIPMENT = [
+    ("Самосвал шоссейный", "MAN TGS", "У 516 МС 790"),
+    ("Самосвал шоссейный", "MAN TGS", "У 496 МС 790"),
+    ("Самосвал шоссейный", "MAN TGS", "Х 333 ВТ 99"),
+    ("Самосвал шоссейный", "MAN TGS", "С 625 ВУ 550"),
+    ("Тягач", "MAN TGS", "В 777 ЕН 150"),
+]
 
 RATE_TYPES = ["За час", "За смену", "За рейс", "Фиксированная", "-"]
 PAYMENT_STATUSES = ["Оплачено", "Частично", "Не оплачено", "Отсрочка"]
 
-HEADERS = [
+SPECIAL_HEADERS = [
     "Дата работы",
     "Наименование техники",
     "Модель",
     "Гос. номер",
     "Машинист / водитель",
-]
-for i in range(1, 5):
-    HEADERS.extend([
-        f"Объект {i}",
-        f"Заказчик {i}",
-        f"Ставка за рейс {i}, ₽",
-        f"Рейсы {i}",
-    ])
-HEADERS.extend([
+    "Объект",
+    "Заказчик",
     "Начало",
     "Окончание",
     "Рабочее время, ч",
     "Вид ставки",
     "Ставка, ₽",
-    "Всего рейсов",
+    "Ставка за рейс, ₽",
+    "Рейс",
     "Сумма, ₽",
     "Статус оплаты",
     "Примечание",
@@ -99,938 +92,883 @@ HEADERS.extend([
     "Пользователь Telegram",
     "Username Telegram",
     "Chat ID",
-])
-
-OLD_HEADERS = [
-    "Дата работы", "Наименование техники", "Модель", "Гос. номер",
-    "Машинист / водитель", "Объект", "Заказчик", "Начало", "Окончание",
-    "Рабочее время, ч", "Вид ставки", "Ставка, ₽", "Рейсы", "Сумма, ₽",
-    "Статус оплаты", "Примечание", "Дата и время сохранения",
-    "Пользователь Telegram", "Username Telegram", "Chat ID",
 ]
 
-(
-    MACHINE, DATE, DATE_MANUAL, DRIVER, OBJECT_COUNT, OBJECT_NAME, CUSTOMER,
-    OBJECT_TRIP_RATE, OBJECT_TRIPS, START_TIME, END_TIME, RATE_TYPE, RATE,
-    GLOBAL_TRIPS, PAYMENT, NOTE, CONFIRM, EDIT_SELECT_REPORT,
-    EDIT_SELECT_FIELD, EDIT_VALUE, EDIT_PAYMENT, EDIT_RATE_TYPE,
-) = range(22)
+DUMP_HEADERS = [
+    "Дата работы",
+    "Наименование техники",
+    "Модель",
+    "Гос. номер",
+    "Машинист / водитель",
+    "Начало",
+    "Окончание",
+    "Рабочее время, ч",
+]
+for i in range(1, 5):
+    DUMP_HEADERS.extend(
+        [
+            f"Объект {i}",
+            f"Заказчик {i}",
+            f"Ставка за рейс {i}, ₽",
+            f"Рейсы {i}",
+            f"Объём кузова {i}, м³",
+            f"Общий объём {i}, м³",
+        ]
+    )
+DUMP_HEADERS.extend(
+    [
+        "Всего рейсов",
+        "Общий объём, м³",
+        "Сумма, ₽",
+        "Статус оплаты",
+        "Примечание",
+        "Дата и время сохранения",
+        "Пользователь Telegram",
+        "Username Telegram",
+        "Chat ID",
+    ]
+)
 
-BASE_COL = {
-    "driver": 5,
-    "start_time": 22,
-    "end_time": 23,
-    "hours": 24,
-    "rate_type": 25,
-    "rate": 26,
-    "total_trips": 27,
-    "amount": 28,
-    "payment_status": 29,
-    "note": 30,
-}
+OSAGO_HEADERS = [
+    "№",
+    "Категория",
+    "Наименование техники",
+    "Модель",
+    "Гос. номер",
+    "Страховая компания",
+    "Серия и номер полиса",
+    "Дата начала",
+    "Дата окончания",
+    "Осталось дней",
+    "Допущенные водители",
+    "Ограничение",
+    "Статус",
+    "Примечание",
+]
+
+DIAG_HEADERS = [
+    "№",
+    "Категория",
+    "Наименование техники",
+    "Модель",
+    "Гос. номер",
+    "Номер диагностической карты",
+    "Дата оформления",
+    "Дата окончания",
+    "Осталось дней",
+    "Статус",
+    "Примечание",
+]
+
+REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
+REF_COLUMNS = {"drivers": 1, "objects": 2, "customers": 3}
+REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
 
 
-def object_col(index: int, field: str) -> int:
-    offsets = {"object": 0, "customer": 1, "trip_rate": 2, "trips": 3}
-    return 6 + (index - 1) * 4 + offsets[field]
-
-
-def _credentials() -> Credentials:
-    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    file_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+def creds() -> Credentials:
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    if raw_json:
-        return Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes)
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(
-            "Не найден service_account.json. Добавьте файл или задайте "
-            "GOOGLE_SERVICE_ACCOUNT_JSON."
-        )
-    return Credentials.from_service_account_file(file_path, scopes=scopes)
+    if raw:
+        return Credentials.from_service_account_info(json.loads(raw), scopes=scopes)
+    path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+    return Credentials.from_service_account_file(path, scopes=scopes)
 
 
-def a1_col(number: int) -> str:
-    result = ""
-    while number:
-        number, remainder = divmod(number - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
+def book():
+    return gspread.authorize(creds()).open_by_key(SPREADSHEET_ID)
 
 
-def pad_row(row: list[str]) -> list[str]:
-    return row + [""] * (len(HEADERS) - len(row))
+def col_letter(n: int) -> str:
+    return gspread.utils.rowcol_to_a1(1, n).rstrip("1")
 
 
-def normalize_number(value: Any) -> str | float:
-    if value in (None, "", "-"):
-        return "-"
-    number = float(str(value).replace(" ", "").replace(",", "."))
-    return int(number) if number.is_integer() else round(number, 2)
-
-
-def number_or_zero(value: Any) -> float:
-    if value in (None, "", "-"):
-        return 0.0
-    return float(str(value).replace(" ", "").replace(",", "."))
-
-
-def format_number(value: Any) -> str:
-    if value in (None, "", "-"):
-        return "-"
-    number = number_or_zero(value)
-    return f"{number:g}"
-
-
-def valid_date(value: str) -> bool:
+def ensure_sheet(spreadsheet, title: str, headers: list[str], rows: int = 1000):
     try:
-        datetime.strptime(value, "%d.%m.%Y")
-        return True
-    except ValueError:
-        return False
-
-
-def valid_time_or_dash(value: str) -> bool:
-    if value == "-":
-        return True
-    try:
-        datetime.strptime(value, "%H:%M")
-        return True
-    except ValueError:
-        return False
-
-
-def calculate_hours(start: str, end: str) -> str | float:
-    if start == "-" or end == "-":
-        return "-"
-    start_dt = datetime.strptime(start, "%H:%M")
-    end_dt = datetime.strptime(end, "%H:%M")
-    minutes = (end_dt.hour * 60 + end_dt.minute) - (start_dt.hour * 60 + start_dt.minute)
-    if minutes < 0:
-        minutes += 24 * 60
-    # Автоматически вычитаем один час обеда.
-    hours = max(0.0, minutes / 60 - 1)
-    return round(hours, 2)
-
-
-def is_multi_machine(data: dict[str, Any]) -> bool:
-    return data.get("plate") in MULTI_OBJECT_PLATES
-
-
-def calculate_totals(data: dict[str, Any]) -> tuple[str | float, float]:
-    if is_multi_machine(data):
-        total_trips = sum(number_or_zero(item.get("trips")) for item in data["objects"])
-        amount = sum(
-            number_or_zero(item.get("trip_rate")) * number_or_zero(item.get("trips"))
-            for item in data["objects"]
-        )
-        return normalize_number(total_trips), round(amount, 2)
-
-    total_trips = normalize_number(data.get("global_trips", "-"))
-    rate = number_or_zero(data.get("rate"))
-    rate_type = data.get("rate_type", "-")
-    hours = number_or_zero(data.get("hours"))
-    trips = number_or_zero(total_trips)
-    if rate_type == "За час":
-        amount = rate * hours
-    elif rate_type == "За рейс":
-        amount = rate * trips
-    elif rate_type in {"За смену", "Фиксированная"}:
-        amount = rate
-    else:
-        amount = 0.0
-    return total_trips, round(amount, 2)
-
-
-def migrate_old_rows(worksheet) -> None:
-    current = worksheet.row_values(1)
-    if current == HEADERS:
-        return
-    if current != OLD_HEADERS:
-        worksheet.update(
-            range_name=f"A1:{a1_col(len(HEADERS))}1",
-            values=[HEADERS],
-            value_input_option="USER_ENTERED",
-        )
-        return
-
-    old_rows = worksheet.get_all_values()[1:]
-    new_rows: list[list[Any]] = []
-    for old in old_rows:
-        old += [""] * (len(OLD_HEADERS) - len(old))
-        new = [""] * len(HEADERS)
-        new[0:5] = old[0:5]
-        new[5] = old[5]
-        new[6] = old[6]
-        new[7] = old[11] if old[10] == "За рейс" else "-"
-        new[8] = old[12] or "-"
-        new[21] = old[7]
-        new[22] = old[8]
-        new[23] = old[9]
-        new[24] = old[10]
-        new[25] = old[11]
-        new[26] = old[12]
-        new[27] = old[13]
-        new[28] = old[14]
-        new[29] = old[15]
-        new[30] = old[16]
-        new[31] = old[17]
-        new[32] = old[18]
-        new[33] = old[19]
-        new_rows.append(new)
-
-    worksheet.clear()
-    worksheet.resize(rows=max(1000, len(new_rows) + 10), cols=len(HEADERS))
-    worksheet.update(
-        range_name=f"A1:{a1_col(len(HEADERS))}{len(new_rows) + 1}",
-        values=[HEADERS] + new_rows,
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=rows, cols=max(10, len(headers)))
+    if ws.col_count < len(headers):
+        ws.add_cols(len(headers) - ws.col_count)
+    ws.update(
+        f"A1:{col_letter(len(headers))}1",
+        [headers],
         value_input_option="USER_ENTERED",
     )
-
-
-def format_worksheet(worksheet) -> None:
-    worksheet.resize(cols=len(HEADERS))
-    worksheet.freeze(rows=1)
-    worksheet.format(
-        f"A1:{a1_col(len(HEADERS))}1",
+    ws.freeze(rows=1)
+    ws.format(
+        f"A1:{col_letter(len(headers))}1",
         {
             "backgroundColor": {"red": 0.08, "green": 0.28, "blue": 0.48},
             "textFormat": {
                 "foregroundColor": {"red": 1, "green": 1, "blue": 1},
                 "bold": True,
-                "fontSize": 10,
             },
             "horizontalAlignment": "CENTER",
             "verticalAlignment": "MIDDLE",
             "wrapStrategy": "WRAP",
         },
     )
+    return ws
 
 
-def get_worksheet():
-    client = gspread.authorize(_credentials())
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+def setup_document_sheet(ws, kind: str) -> None:
+    if kind == "osago":
+        last_col, end_col, days_col, status_col = "N", 9, 10, 13
+    else:
+        last_col, end_col, days_col, status_col = "K", 8, 9, 10
+
     try:
-        worksheet = spreadsheet.worksheet(SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=SHEET_NAME, rows=1000, cols=len(HEADERS)
+        ws.set_basic_filter(f"A1:{last_col}500")
+    except Exception:
+        logger.exception("Не удалось установить фильтр для %s", ws.title)
+
+    rows = []
+    for row in range(2, 502):
+        end_letter = col_letter(end_col)
+        days_letter = col_letter(days_col)
+        rows.append(
+            [
+                f'=IF(C{row}="","",ROW()-1)',
+                f'=IF({end_letter}{row}="","",{end_letter}{row}-TODAY())',
+                (
+                    f'=IF({end_letter}{row}="","Нет данных",'
+                    f'IF({days_letter}{row}<0,"Просрочен",'
+                    f'IF({days_letter}{row}<=30,"Заканчивается","Действует")))'
+                ),
+            ]
         )
-    migrate_old_rows(worksheet)
-    worksheet.update(
-        range_name=f"A1:{a1_col(len(HEADERS))}1",
-        values=[HEADERS],
+
+    ws.update("A2:A501", [[x[0]] for x in rows], value_input_option="USER_ENTERED")
+    dcol = col_letter(days_col)
+    scol = col_letter(status_col)
+    ws.update(f"{dcol}2:{dcol}501", [[x[1]] for x in rows], value_input_option="USER_ENTERED")
+    ws.update(f"{scol}2:{scol}501", [[x[2]] for x in rows], value_input_option="USER_ENTERED")
+
+    sheet_id = ws.id
+    requests = []
+    for text, color in [
+        ("Действует", {"red": 0.78, "green": 0.94, "blue": 0.80}),
+        ("Заканчивается", {"red": 1.0, "green": 0.93, "blue": 0.65}),
+        ("Просрочен", {"red": 0.98, "green": 0.72, "blue": 0.72}),
+        ("Нет данных", {"red": 0.90, "green": 0.90, "blue": 0.90}),
+    ]:
+        requests.append(
+            {
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [
+                            {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": 501,
+                                "startColumnIndex": status_col - 1,
+                                "endColumnIndex": status_col,
+                            }
+                        ],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "TEXT_EQ",
+                                "values": [{"userEnteredValue": text}],
+                            },
+                            "format": {
+                                "backgroundColor": color,
+                                "textFormat": {"bold": True},
+                            },
+                        },
+                    },
+                    "index": 0,
+                }
+            }
+        )
+    try:
+        ws.spreadsheet.batch_update({"requests": requests})
+    except Exception:
+        logger.exception("Не удалось добавить условное форматирование %s", ws.title)
+
+
+def setup_dashboard(ws, kind: str) -> None:
+    if kind == "osago":
+        start_col, status_col = "P", "M"
+    else:
+        start_col, status_col = "M", "J"
+    start_num = gspread.utils.a1_to_rowcol(start_col + "1")[1]
+    end_col = col_letter(start_num + 1)
+    ws.update(
+        f"{start_col}1:{end_col}5",
+        [
+            ["Сводка", "Количество"],
+            ["Всего документов", f'=COUNTIF({status_col}2:{status_col},"<>")'],
+            ["Действует", f'=COUNTIF({status_col}2:{status_col},"Действует")'],
+            ["Заканчивается", f'=COUNTIF({status_col}2:{status_col},"Заканчивается")'],
+            ["Просрочен", f'=COUNTIF({status_col}2:{status_col},"Просрочен")'],
+        ],
         value_input_option="USER_ENTERED",
     )
-    try:
-        format_worksheet(worksheet)
-    except Exception:
-        logger.exception("Не удалось оформить таблицу")
-    return worksheet
+    ws.format(
+        f"{start_col}1:{end_col}1",
+        {
+            "backgroundColor": {"red": 0.08, "green": 0.28, "blue": 0.48},
+            "textFormat": {
+                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                "bold": True,
+            },
+        },
+    )
 
 
-def first_empty_row(worksheet) -> int:
-    values = worksheet.get("A2:A")
-    for row_number, row in enumerate(values, start=2):
-        if not row or not str(row[0]).strip():
-            return row_number
-    return len(values) + 2
+def initialize_sheets():
+    sp = book()
+    titles = [ws.title for ws in sp.worksheets()]
+    if "Отчеты" in titles and SHEET_SPECIAL not in titles:
+        sp.worksheet("Отчеты").update_title(SHEET_SPECIAL)
+
+    special = ensure_sheet(sp, SHEET_SPECIAL, SPECIAL_HEADERS)
+    dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
+    osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 500)
+    diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 500)
+    refs = ensure_sheet(sp, SHEET_REFS, REF_HEADERS, 500)
+
+    setup_document_sheet(osago, "osago")
+    setup_dashboard(osago, "osago")
+    setup_document_sheet(diag, "diag")
+    setup_dashboard(diag, "diag")
+    return special, dump, refs
 
 
-def save_report(worksheet, row_data: list[Any]) -> int:
-    row_number = first_empty_row(worksheet)
-    end_col = a1_col(len(HEADERS))
-    worksheet.update(
-        range_name=f"A{row_number}:{end_col}{row_number}",
-        values=[row_data],
+def first_empty_row(ws, column: int = 1) -> int:
+    values = ws.col_values(column)
+    return max(2, len(values) + 1)
+
+
+def save_row(ws, row: list[Any]) -> int:
+    n = first_empty_row(ws, 1)
+    ws.update(
+        f"A{n}:{col_letter(len(row))}{n}",
+        [row],
         value_input_option="USER_ENTERED",
     )
-    worksheet.format(
-        f"A{row_number}:{end_col}{row_number}",
-        {"verticalAlignment": "MIDDLE", "wrapStrategy": "WRAP"},
-    )
-    return row_number
+    return n
 
 
-def equipment_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{index}. {name} {model} — {plate}",
-            callback_data=f"machine|{index - 1}",
-        )]
-        for index, (name, model, plate) in enumerate(EQUIPMENT, start=1)
-    ])
+def normalize(value: str) -> str:
+    return " ".join(value.strip().casefold().split())
 
 
-def inline_keyboard(values: list[str], prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(value, callback_data=f"{prefix}|{i}")]
-        for i, value in enumerate(values)
-    ])
+def ref_values(kind: str) -> list[str]:
+    _, _, refs = initialize_sheets()
+    col = REF_COLUMNS[kind]
+    values = refs.col_values(col)[1:]
+    return [v.strip() for v in values if v.strip()]
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [["🚜 Новый отчет", "✏️ Изменить отчет"]], resize_keyboard=True
-    )
+def add_ref(kind: str, value: str) -> tuple[bool, str]:
+    value = " ".join(value.strip().split())
+    if not value:
+        return False, "Пустое значение нельзя добавить."
+    values = ref_values(kind)
+    if normalize(value) in {normalize(v) for v in values}:
+        return False, "Такая запись уже существует."
+    _, _, refs = initialize_sheets()
+    col = REF_COLUMNS[kind]
+    row = first_empty_row(refs, col)
+    refs.update_cell(row, col, value)
+    return True, value
 
 
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "Выберите действие:", reply_markup=main_keyboard()
-    )
-    return ConversationHandler.END
+def delete_ref(kind: str, index: int) -> str:
+    values = ref_values(kind)
+    if index < 0 or index >= len(values):
+        raise ValueError("Запись не найдена")
+    _, _, refs = initialize_sheets()
+    col = REF_COLUMNS[kind]
+    target = values[index]
+    column_values = refs.col_values(col)
+    for row, item in enumerate(column_values[1:], start=2):
+        if normalize(item) == normalize(target):
+            refs.update_cell(row, col, "")
+            return target
+    raise ValueError("Запись не найдена")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "🚜 Выберите технику:", reply_markup=equipment_keyboard()
-    )
-    return MACHINE
+def number_or_dash(text: str) -> float | str:
+    text = text.strip()
+    return "-" if text == "-" else float(text.replace(" ", "").replace(",", "."))
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.effective_message.reply_text(
-        "Отчёт отменён.", reply_markup=main_keyboard()
-    )
-    return ConversationHandler.END
-
-
-async def machine_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    index = int(query.data.split("|", 1)[1])
-    name, model, plate = EQUIPMENT[index]
-    context.user_data.update({
-        "equipment_name": name,
-        "equipment_model": model,
-        "plate": plate,
-        "objects": [],
-    })
-    await query.edit_message_text(
-        "📅 Укажите дату работы:",
-        reply_markup=inline_keyboard(["Сегодня", "Другая дата"], "date"),
-    )
-    return DATE
-
-
-async def date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if int(query.data.split("|", 1)[1]) == 0:
-        context.user_data["work_date"] = datetime.now().strftime("%d.%m.%Y")
-        await query.edit_message_text("👷 Введите имя машиниста или водителя:")
-        return DRIVER
-    await query.edit_message_text("Введите дату в формате ДД.ММ.ГГГГ:")
-    return DATE_MANUAL
-
-
-async def date_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not valid_date(text):
-        await update.message.reply_text("Неверный формат. Пример: 30.07.2026")
-        return DATE_MANUAL
-    context.user_data["work_date"] = text
-    await update.message.reply_text("👷 Введите имя машиниста или водителя:")
-    return DRIVER
-
-
-async def driver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["driver"] = update.message.text.strip()
-    if is_multi_machine(context.user_data):
-        await update.message.reply_text(
-            "Сколько объектов указать? Выберите от 1 до 4:",
-            reply_markup=inline_keyboard(["1", "2", "3", "4"], "objcount"),
-        )
-        return OBJECT_COUNT
-    context.user_data["object_count"] = 1
-    context.user_data["current_object"] = 1
-    await update.message.reply_text("📍 Введите объект 1:")
-    return OBJECT_NAME
-
-
-async def object_count_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    count = int(query.data.split("|", 1)[1]) + 1
-    context.user_data["object_count"] = count
-    context.user_data["current_object"] = 1
-    await query.edit_message_text("📍 Введите объект 1:")
-    return OBJECT_NAME
-
-
-async def object_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending_object"] = {"object": update.message.text.strip()}
-    number = context.user_data["current_object"]
-    await update.message.reply_text(f"🏢 Введите заказчика {number} или отправьте «-»:")
-    return CUSTOMER
-
-
-async def customer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    context.user_data["pending_object"]["customer"] = "" if text == "-" else text
-    if is_multi_machine(context.user_data):
-        number = context.user_data["current_object"]
-        await update.message.reply_text(
-            f"💰 Введите ставку за рейс для объекта {number} или «-»:"
-        )
-        return OBJECT_TRIP_RATE
-
-    context.user_data["pending_object"].update({"trip_rate": "-", "trips": "-"})
-    context.user_data["objects"].append(context.user_data.pop("pending_object"))
-    await update.message.reply_text("🕘 Введите время начала ЧЧ:ММ или «-»:")
-    return START_TIME
-
-
-async def object_trip_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
+def valid_time(text: str) -> bool:
+    if text.strip() == "-":
+        return True
     try:
-        value = normalize_number(text)
-        if value != "-" and number_or_zero(value) < 0:
-            raise ValueError
+        datetime.strptime(text.strip(), "%H:%M")
+        return True
     except ValueError:
-        await update.message.reply_text("Введите число 0 или больше либо «-»:")
-        return OBJECT_TRIP_RATE
-    context.user_data["pending_object"]["trip_rate"] = value
-    number = context.user_data["current_object"]
-    await update.message.reply_text(
-        f"🚚 Введите количество рейсов по объекту {number} или «-»:"
-    )
-    return OBJECT_TRIPS
+        return False
 
 
-async def object_trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    try:
-        value = normalize_number(text)
-        if value != "-" and number_or_zero(value) < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число 0 или больше либо «-»:")
-        return OBJECT_TRIPS
-
-    context.user_data["pending_object"]["trips"] = value
-    context.user_data["objects"].append(context.user_data.pop("pending_object"))
-    current = context.user_data["current_object"]
-    if current < context.user_data["object_count"]:
-        context.user_data["current_object"] = current + 1
-        await update.message.reply_text(f"📍 Введите объект {current + 1}:")
-        return OBJECT_NAME
-
-    await update.message.reply_text("🕘 Введите время начала ЧЧ:ММ или «-»:")
-    return START_TIME
+def work_hours(start: str, end: str) -> float | str:
+    if "-" in (start, end):
+        return "-"
+    s = datetime.strptime(start, "%H:%M")
+    e = datetime.strptime(end, "%H:%M")
+    minutes = e.hour * 60 + e.minute - (s.hour * 60 + s.minute)
+    if minutes < 0:
+        minutes += 1440
+    return round(max(0, minutes - 60) / 60, 2)
 
 
-async def start_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not valid_time_or_dash(text):
-        await update.message.reply_text("Введите время ЧЧ:ММ, например 08:00, либо «-»:")
-        return START_TIME
-    context.user_data["start_time"] = text
-    await update.message.reply_text("🕔 Введите время окончания ЧЧ:ММ или «-»:")
-    return END_TIME
+def calc_special(d: dict[str, Any]) -> float | str:
+    rt = d["rate_type"]
+    rate = d.get("rate", "-")
+    rate_trip = d.get("rate_trip", "-")
+    trips = d.get("trips", "-")
+    hours = d["hours"]
+    if rt == "-":
+        return "-"
+    if rt == "За час":
+        return "-" if "-" in (rate, hours) else round(float(rate) * float(hours), 2)
+    if rt == "За рейс":
+        return "-" if "-" in (rate_trip, trips) else round(float(rate_trip) * float(trips), 2)
+    return "-" if rate == "-" else round(float(rate), 2)
 
 
-async def end_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not valid_time_or_dash(text):
-        await update.message.reply_text("Введите время ЧЧ:ММ, например 17:00, либо «-»:")
-        return END_TIME
-    context.user_data["end_time"] = text
-    context.user_data["hours"] = calculate_hours(context.user_data["start_time"], text)
-    await update.message.reply_text(
-        f"Рабочее время: {format_number(context.user_data['hours'])} ч. "
-        "(если указано время, 1 час обеда уже вычтен).\nВыберите вид ставки:",
-        reply_markup=inline_keyboard(RATE_TYPES, "rate_type"),
-    )
-    return RATE_TYPE
-
-
-async def rate_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data["rate_type"] = RATE_TYPES[int(query.data.split("|", 1)[1])]
-    await query.edit_message_text("💰 Введите ставку или «-»:")
-    return RATE
-
-
-async def rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    try:
-        value = normalize_number(text)
-        if value != "-" and number_or_zero(value) < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число 0 или больше либо «-»:")
-        return RATE
-    context.user_data["rate"] = value
-
-    if is_multi_machine(context.user_data):
-        context.user_data["global_trips"] = "-"
-        return await ask_payment(update, context)
-
-    await update.message.reply_text("🚚 Введите количество рейсов или «-»:")
-    return GLOBAL_TRIPS
-
-
-async def global_trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    try:
-        value = normalize_number(text)
-        if value != "-" and number_or_zero(value) < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Введите число 0 или больше либо «-»:")
-        return GLOBAL_TRIPS
-    context.user_data["global_trips"] = value
-    return await ask_payment(update, context)
-
-
-async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(
-        "💳 Выберите статус оплаты:",
-        reply_markup=inline_keyboard(PAYMENT_STATUSES, "payment"),
-    )
-    return PAYMENT
-
-
-async def payment_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data["payment_status"] = PAYMENT_STATUSES[
-        int(query.data.split("|", 1)[1])
-    ]
-    await query.edit_message_text("📝 Добавьте примечание или отправьте «-»:")
-    return NOTE
-
-
-def report_text(data: dict[str, Any]) -> str:
-    lines = [
-        "Проверьте отчёт:\n",
-        f"📅 {data['work_date']}",
-        f"🚜 {data['equipment_name']} {data['equipment_model']}",
-        f"🔢 {data['plate']}",
-        f"👷 {data['driver']}",
-    ]
-    for index, item in enumerate(data["objects"], start=1):
-        lines.extend([
-            f"📍 Объект {index}: {item['object']}",
-            f"🏢 Заказчик {index}: {item.get('customer') or '—'}",
-        ])
-        if is_multi_machine(data):
-            lines.append(
-                f"🚚 {format_number(item.get('trips'))} рейс.; "
-                f"ставка {format_number(item.get('trip_rate'))} ₽/рейс"
-            )
-    lines.extend([
-        f"🕘 {data['start_time']}–{data['end_time']}",
-        f"⏱ {format_number(data['hours'])} ч.",
-        f"💰 {data['rate_type']}; ставка {format_number(data['rate'])} ₽",
-        f"🚚 Всего рейсов: {format_number(data['total_trips'])}",
-        f"🧾 Сумма: {format_number(data['amount'])} ₽",
-        f"💳 {data['payment_status']}",
-        f"📝 {data['note'] or '—'}",
-    ])
-    return "\n".join(lines)
-
-
-async def note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    context.user_data["note"] = "" if text == "-" else text
-    total_trips, amount = calculate_totals(context.user_data)
-    context.user_data["total_trips"] = total_trips
-    context.user_data["amount"] = amount
-    await update.message.reply_text(
-        report_text(context.user_data),
-        reply_markup=inline_keyboard(["Сохранить", "Отменить"], "confirm"),
-    )
-    return CONFIRM
-
-
-def build_row(data: dict[str, Any], user: Any, chat_id: int) -> list[Any]:
-    row: list[Any] = [
-        data["work_date"], data["equipment_name"], data["equipment_model"],
-        data["plate"], data["driver"],
-    ]
-    for i in range(4):
-        if i < len(data["objects"]):
-            item = data["objects"][i]
-            trip_rate = item.get("trip_rate", "-")
-            trips = item.get("trips", "-")
-            # Для обычной техники единственный объект получает общие рейсы.
-            # Это сохраняет корректный пересчёт при последующем изменении отчёта.
-            if i == 0 and not is_multi_machine(data):
-                trips = data.get("global_trips", "-")
-                if data.get("rate_type") == "За рейс":
-                    trip_rate = data.get("rate", "-")
-            row.extend([
-                item.get("object", ""), item.get("customer", ""),
-                trip_rate, trips,
-            ])
-        else:
-            row.extend(["", "", "-", "-"])
-    row.extend([
-        data["start_time"], data["end_time"], data["hours"],
-        data["rate_type"], data["rate"], data["total_trips"], data["amount"],
-        data["payment_status"], data["note"],
-        datetime.now().strftime("%d.%m.%Y %H:%M:%S"), user.full_name,
-        f"@{user.username}" if user.username else "", str(chat_id),
-    ])
-    return row
-
-
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if int(query.data.split("|", 1)[1]) == 1:
-        context.user_data.clear()
-        await query.edit_message_text("Отчёт отменён.")
-        await query.message.reply_text("Выберите действие:", reply_markup=main_keyboard())
-        return ConversationHandler.END
-
-    try:
-        worksheet = get_worksheet()
-        saved_row = save_report(
-            worksheet,
-            build_row(context.user_data, update.effective_user, update.effective_chat.id),
-        )
-    except Exception:
-        logger.exception("Не удалось записать отчёт")
-        await query.edit_message_text("❌ Не удалось записать отчёт. Проверьте Railway Logs.")
-        return CONFIRM
-
-    await query.edit_message_text(
-        "✅ Отчёт сохранён.\n\n"
-        f"Техника: {context.user_data['equipment_name']} "
-        f"{context.user_data['equipment_model']}\n"
-        f"Гос. номер: {context.user_data['plate']}\n"
-        f"Всего рейсов: {format_number(context.user_data['total_trips'])}\n"
-        f"Сумма: {format_number(context.user_data['amount'])} ₽\n"
-        f"Строка таблицы: {saved_row}"
-    )
-    await query.message.reply_text("Выберите действие:", reply_markup=main_keyboard())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-def report_summary(row_number: int, raw_row: list[str]) -> str:
-    row = pad_row(raw_row)
+def calc_dump(objects: list[dict[str, Any]]):
+    total_trips = total_volume = total_amount = 0.0
+    has_t = has_v = has_a = False
+    for obj in objects:
+        trips, volume, rate_trip = obj["trips"], obj["volume"], obj["rate_trip"]
+        if trips != "-":
+            total_trips += float(trips)
+            has_t = True
+        if trips != "-" and volume != "-":
+            total_volume += float(trips) * float(volume)
+            has_v = True
+        if trips != "-" and rate_trip != "-":
+            total_amount += float(trips) * float(rate_trip)
+            has_a = True
     return (
-        f"Строка {row_number}\n"
-        f"Дата: {row[0]}\n"
-        f"Техника: {row[1]} {row[2]} — {row[3]}\n"
-        f"Водитель: {row[4] or '—'}\n"
-        f"Объект 1: {row[5] or '—'}\n"
-        f"Заказчик 1: {row[6] or '—'}\n"
-        f"Начало–окончание: {row[21] or '—'}–{row[22] or '—'}\n"
-        f"Рабочее время: {row[23] or '—'}\n"
-        f"Вид ставки: {row[24] or '—'}\n"
-        f"Ставка: {row[25] or '—'}\n"
-        f"Всего рейсов: {row[26] or '—'}\n"
-        f"Сумма: {row[27] or '—'} ₽\n"
-        f"Статус: {row[28] or '—'}"
+        round(total_trips, 2) if has_t else "-",
+        round(total_volume, 2) if has_v else "-",
+        round(total_amount, 2) if has_a else "-",
     )
 
 
-def edit_fields_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton("👷 Водителя", callback_data="editfield|driver")],
-        [InlineKeyboardButton("🕘 Начало", callback_data="editfield|start_time")],
-        [InlineKeyboardButton("🕔 Окончание", callback_data="editfield|end_time")],
-        [InlineKeyboardButton("💰 Вид ставки", callback_data="editfield|rate_type")],
-        [InlineKeyboardButton("💵 Ставку", callback_data="editfield|rate")],
-        [InlineKeyboardButton("💳 Статус оплаты", callback_data="editfield|payment_status")],
-        [InlineKeyboardButton("📝 Примечание", callback_data="editfield|note")],
+def menu():
+    return ReplyKeyboardMarkup(
+        [
+            ["🚜 Спецтехника", "🚛 Самосвалы"],
+            ["✏️ Изменить отчет", "⚙️ Справочники"],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def buttons(values: list[str], prefix: str):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(v, callback_data=f"{prefix}|{i}")] for i, v in enumerate(values)]
+    )
+
+
+def machine_buttons(items):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{i + 1}. {name} | {model} | {plate}",
+                    callback_data=f"machine|{i}",
+                )
+            ]
+            for i, (name, model, plate) in enumerate(items)
+        ]
+    )
+
+
+def ref_keyboard(kind: str, include_none: bool = False):
+    values = ref_values(kind)
+    rows = [
+        [InlineKeyboardButton(v[:55], callback_data=f"refsel|{kind}|{i}")]
+        for i, v in enumerate(values[:40])
     ]
-    for i in range(1, 5):
-        buttons.append([
-            InlineKeyboardButton(f"📍 Объект {i}", callback_data=f"editfield|object_{i}"),
-            InlineKeyboardButton(f"🏢 Заказчик {i}", callback_data=f"editfield|customer_{i}"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"💰 Ставка/рейс {i}", callback_data=f"editfield|trip_rate_{i}"),
-            InlineKeyboardButton(f"🚚 Рейсы {i}", callback_data=f"editfield|trips_{i}"),
-        ])
-    return InlineKeyboardMarkup(buttons)
+    if include_none:
+        rows.append([InlineKeyboardButton("➖ Без заказчика", callback_data=f"refnone|{kind}")])
+    rows.append([InlineKeyboardButton("➕ Добавить", callback_data=f"refadd|{kind}")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def edit_report_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    try:
-        rows = get_worksheet().get_all_values()
-    except Exception:
-        logger.exception("Не удалось загрузить отчёты")
-        await update.effective_message.reply_text(
-            "❌ Не удалось загрузить отчёты.", reply_markup=main_keyboard()
-        )
-        return ConversationHandler.END
-
-    reports = []
-    for row_number in range(len(rows), 1, -1):
-        row = pad_row(rows[row_number - 1])
-        if row[0].strip():
-            reports.append((row_number, row))
-        if len(reports) >= 20:
-            break
-    if not reports:
-        await update.effective_message.reply_text(
-            "В таблице пока нет отчётов.", reply_markup=main_keyboard()
-        )
-        return ConversationHandler.END
-
-    buttons = [[InlineKeyboardButton(
-        f"{row[0]} | {row[2]} | {row[3]} | {row[4] or 'без водителя'}"[:64],
-        callback_data=f"editrow|{row_number}",
-    )] for row_number, row in reports]
-    await update.effective_message.reply_text(
-        "Выберите отчёт для изменения:", reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return EDIT_SELECT_REPORT
+    initialize_sheets()
+    await update.effective_message.reply_text("Выберите раздел:", reply_markup=menu())
 
 
-async def edit_report_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    row_number = int(query.data.split("|", 1)[1])
-    try:
-        row = get_worksheet().row_values(row_number)
-    except Exception:
-        logger.exception("Не удалось открыть отчёт")
-        await query.edit_message_text("❌ Не удалось открыть отчёт.")
-        return ConversationHandler.END
-    context.user_data["edit_row"] = row_number
-    await query.edit_message_text(
-        report_summary(row_number, row) + "\n\nЧто изменить?",
-        reply_markup=edit_fields_keyboard(),
-    )
-    return EDIT_SELECT_FIELD
-
-
-async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    field = query.data.split("|", 1)[1]
-    context.user_data["edit_field"] = field
-    if field == "payment_status":
-        await query.edit_message_text(
-            "Выберите статус:", reply_markup=inline_keyboard(PAYMENT_STATUSES, "editpayment")
-        )
-        return EDIT_PAYMENT
-    if field == "rate_type":
-        await query.edit_message_text(
-            "Выберите вид ставки:", reply_markup=inline_keyboard(RATE_TYPES, "editratetype")
-        )
-        return EDIT_RATE_TYPE
-
-    prompts = {
-        "driver": "Введите водителя:",
-        "start_time": "Введите время начала ЧЧ:ММ или «-»: ",
-        "end_time": "Введите время окончания ЧЧ:ММ или «-»: ",
-        "rate": "Введите ставку или «-»: ",
-        "note": "Введите примечание или «-»: ",
-    }
-    if field.startswith("object_"):
-        prompt = "Введите объект или «-»:"
-    elif field.startswith("customer_"):
-        prompt = "Введите заказчика или «-»:"
-    elif field.startswith("trip_rate_"):
-        prompt = "Введите ставку за рейс или «-»:"
-    elif field.startswith("trips_"):
-        prompt = "Введите количество рейсов или «-»:"
-    else:
-        prompt = prompts[field]
-    await query.edit_message_text(prompt)
-    return EDIT_VALUE
-
-
-def field_column(field: str) -> int:
-    if field in BASE_COL:
-        return BASE_COL[field]
-    prefix, index_text = field.rsplit("_", 1)
-    return object_col(int(index_text), prefix)
-
-
-def recalculate_row_values(row: list[str]) -> tuple[str | float, float, str | float]:
-    row = pad_row(row)
-    hours = calculate_hours(row[21] or "-", row[22] or "-")
-    total_trips = sum(number_or_zero(row[object_col(i, "trips") - 1]) for i in range(1, 5))
-    multi_amount = sum(
-        number_or_zero(row[object_col(i, "trip_rate") - 1])
-        * number_or_zero(row[object_col(i, "trips") - 1])
-        for i in range(1, 5)
-    )
-    if row[3] in MULTI_OBJECT_PLATES:
-        amount = multi_amount
-    else:
-        rate_type = row[24] or "-"
-        rate = number_or_zero(row[25])
-        if rate_type == "За час":
-            amount = rate * number_or_zero(hours)
-        elif rate_type == "За рейс":
-            amount = rate * total_trips
-        elif rate_type in {"За смену", "Фиксированная"}:
-            amount = rate
-        else:
-            amount = 0
-    return hours, round(amount, 2), normalize_number(total_trips)
-
-
-async def edit_value_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    field = context.user_data.get("edit_field")
-    row_number = context.user_data.get("edit_row")
-    if not field or not row_number:
-        await update.message.reply_text("Сеанс изменения завершён.", reply_markup=main_keyboard())
-        return ConversationHandler.END
-
-    text = update.message.text.strip()
-    if field in {"start_time", "end_time"} and not valid_time_or_dash(text):
-        await update.message.reply_text("Введите ЧЧ:ММ или «-»:")
-        return EDIT_VALUE
-    if field == "rate" or field.startswith("trip_rate_") or field.startswith("trips_"):
-        try:
-            value: Any = normalize_number(text)
-            if value != "-" and number_or_zero(value) < 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("Введите число 0 или больше либо «-»:")
-            return EDIT_VALUE
-    elif field == "driver":
-        value = text
-    else:
-        value = "" if text == "-" else text
-
-    try:
-        worksheet = get_worksheet()
-        worksheet.update_cell(row_number, field_column(field), value)
-        row = worksheet.row_values(row_number)
-        hours, amount, total_trips = recalculate_row_values(row)
-        worksheet.update(
-            range_name=f"X{row_number}:AB{row_number}",
-            values=[[hours, pad_row(row)[24], pad_row(row)[25], total_trips, amount]],
-            value_input_option="USER_ENTERED",
-        )
-        updated = worksheet.row_values(row_number)
-    except Exception:
-        logger.exception("Не удалось изменить отчёт")
-        await update.message.reply_text("❌ Не удалось изменить отчёт.", reply_markup=main_keyboard())
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "✅ Отчёт изменён.\n\n" + report_summary(row_number, updated),
-        reply_markup=main_keyboard(),
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def edit_payment_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    row_number = context.user_data.get("edit_row")
-    status = PAYMENT_STATUSES[int(query.data.split("|", 1)[1])]
-    try:
-        worksheet = get_worksheet()
-        worksheet.update_cell(row_number, BASE_COL["payment_status"], status)
-        updated = worksheet.row_values(row_number)
-    except Exception:
-        logger.exception("Не удалось изменить статус")
-        await query.edit_message_text("❌ Не удалось изменить отчёт.")
-        return ConversationHandler.END
-    await query.edit_message_text("✅ Статус изменён.\n\n" + report_summary(row_number, updated))
-    await query.message.reply_text("Выберите действие:", reply_markup=main_keyboard())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def edit_rate_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    row_number = context.user_data.get("edit_row")
-    value = RATE_TYPES[int(query.data.split("|", 1)[1])]
-    try:
-        worksheet = get_worksheet()
-        worksheet.update_cell(row_number, BASE_COL["rate_type"], value)
-        row = worksheet.row_values(row_number)
-        hours, amount, total_trips = recalculate_row_values(row)
-        worksheet.update(
-            range_name=f"X{row_number}:AB{row_number}",
-            values=[[hours, value, pad_row(row)[25], total_trips, amount]],
-            value_input_option="USER_ENTERED",
-        )
-        updated = worksheet.row_values(row_number)
-    except Exception:
-        logger.exception("Не удалось изменить вид ставки")
-        await query.edit_message_text("❌ Не удалось изменить отчёт.")
-        return ConversationHandler.END
-    await query.edit_message_text("✅ Вид ставки изменён.\n\n" + report_summary(row_number, updated))
-    await query.message.reply_text("Выберите действие:", reply_markup=main_keyboard())
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Версия бота: {BOT_VERSION}\n"
-        f"Техники в списке: {len(EQUIPMENT)}\n"
-        "Поддерживаются до 4 объектов для шоссейных MAN и тягача."
+        "Вкладки: Спецтехника, Самосвалы, ОСАГО, Диагностические карты, Справочники."
     )
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Ошибка при обработке обновления", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "Произошла ошибка. Попробуйте ещё раз командой /start."
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text("Действие отменено.", reply_markup=menu())
+
+
+async def begin_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data.update(flow="new", category="special", step="machine")
+    await update.effective_message.reply_text(
+        "Выберите спецтехнику:", reply_markup=machine_buttons(SPECIAL_EQUIPMENT)
+    )
+
+
+async def begin_dump(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data.update(flow="new", category="dump", step="machine")
+    await update.effective_message.reply_text(
+        "Выберите самосвал или тягач:", reply_markup=machine_buttons(DUMP_EQUIPMENT)
+    )
+
+
+async def refs_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data.update(flow="refs", step="refs_menu")
+    await update.effective_message.reply_text(
+        "Выберите справочник:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("👷 Водители", callback_data="refs|drivers")],
+                [InlineKeyboardButton("📍 Объекты", callback_data="refs|objects")],
+                [InlineKeyboardButton("🏢 Заказчики", callback_data="refs|customers")],
+            ]
+        ),
+    )
+
+
+async def ask_ref(message, context: ContextTypes.DEFAULT_TYPE, kind: str, next_step: str, include_none: bool = False):
+    context.user_data["ref_next_step"] = next_step
+    context.user_data["ref_kind"] = kind
+    context.user_data["step"] = "ref_choice"
+    await message.reply_text(
+        f"Выберите: {REF_TITLES[kind]}",
+        reply_markup=ref_keyboard(kind, include_none=include_none),
+    )
+
+
+async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: str, value: str):
+    d = context.user_data
+    next_step = d.get("ref_next_step")
+    if kind == "drivers":
+        d["driver"] = value
+        d["step"] = "start_time"
+        await message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
+    elif kind == "objects":
+        if d["category"] == "special":
+            d["object"] = value
+            await ask_ref(message, context, "customers", "special_customer", include_none=True)
+        else:
+            d["current"] = {"object": value}
+            await ask_ref(message, context, "customers", "dump_customer", include_none=True)
+    elif kind == "customers":
+        if next_step == "special_customer":
+            d["customer"] = value
+            d["step"] = "rate_type"
+            await message.reply_text(
+                "Выберите вид ставки:", reply_markup=buttons(RATE_TYPES, "ratetype")
+            )
+        else:
+            d["current"]["customer"] = value
+            d["step"] = "dump_rate"
+            await message.reply_text("Введите ставку за рейс или «-»:")
+
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split("|")
+    action = parts[0]
+    d = context.user_data
+
+    if action == "machine":
+        items = SPECIAL_EQUIPMENT if d["category"] == "special" else DUMP_EQUIPMENT
+        d["name"], d["model"], d["plate"] = items[int(parts[1])]
+        d["step"] = "date_choice"
+        await q.edit_message_text(
+            "Укажите дату работы:",
+            reply_markup=buttons(["Сегодня", "Другая дата"], "date"),
         )
+    elif action == "date":
+        if parts[1] == "0":
+            d["work_date"] = datetime.now().strftime("%d.%m.%Y")
+            await q.edit_message_text("Дата выбрана.")
+            await ask_ref(q.message, context, "drivers", "driver")
+        else:
+            d["step"] = "date_manual"
+            await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:")
+    elif action == "ratetype":
+        d["rate_type"] = RATE_TYPES[int(parts[1])]
+        if d["rate_type"] == "За рейс":
+            d["rate"] = "-"
+            d["step"] = "rate_trip"
+            await q.edit_message_text("Введите ставку за рейс или «-»:")
+        else:
+            d["rate_trip"] = "-"
+            d["trips"] = "-"
+            d["step"] = "rate"
+            await q.edit_message_text("Введите ставку или «-»:")
+    elif action == "objcount":
+        d["object_count"] = int(parts[1]) + 1
+        d["object_index"] = 1
+        d["objects"] = []
+        await q.edit_message_text("Количество объектов выбрано.")
+        await ask_ref(q.message, context, "objects", "dump_object")
+    elif action == "payment":
+        d["payment"] = PAYMENT_STATUSES[int(parts[1])]
+        d["step"] = "note"
+        await q.edit_message_text("Введите примечание или «-»:")
+    elif action == "confirm":
+        if parts[1] == "1":
+            context.user_data.clear()
+            await q.edit_message_text("Отчёт отменён.")
+            await q.message.reply_text("Выберите действие:", reply_markup=menu())
+            return
+        await save_current_report(q, context)
+    elif action == "editsheet":
+        await show_edit_rows(q, context, parts[1])
+    elif action == "editrow":
+        d["edit_row"] = int(parts[1])
+        d["step"] = "edit_command"
+        await q.edit_message_text(
+            "Введите изменение в формате:\nномер_колонки=новое значение\n"
+            "Например: 8=09:00\nНомера колонок смотрите в первой строке таблицы."
+        )
+    elif action == "refsel":
+        kind, index = parts[1], int(parts[2])
+        values = ref_values(kind)
+        await q.edit_message_text(f"Выбрано: {values[index]}")
+        await after_ref_selected(q.message, context, kind, values[index])
+    elif action == "refnone":
+        kind = parts[1]
+        await q.edit_message_text("Выбрано: без заказчика")
+        await after_ref_selected(q.message, context, kind, "")
+    elif action == "refadd":
+        d["add_ref_kind"] = parts[1]
+        d["step"] = "add_ref_value"
+        await q.edit_message_text(f"Введите новое значение для «{REF_TITLES[parts[1]]}»:")
+    elif action == "refs":
+        kind = parts[1]
+        d["manage_ref_kind"] = kind
+        values = ref_values(kind)
+        text_value = "\n".join(f"{i+1}. {v}" for i, v in enumerate(values)) or "Список пуст."
+        await q.edit_message_text(
+            f"{REF_TITLES[kind]}:\n\n{text_value[:3000]}",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("➕ Добавить", callback_data=f"refmanageadd|{kind}")],
+                    [InlineKeyboardButton("🗑 Удалить", callback_data=f"refdelmenu|{kind}")],
+                ]
+            ),
+        )
+    elif action == "refmanageadd":
+        d["add_ref_kind"] = parts[1]
+        d["step"] = "manage_add_ref_value"
+        await q.edit_message_text(f"Введите новое значение для «{REF_TITLES[parts[1]]}»:")
+    elif action == "refdelmenu":
+        kind = parts[1]
+        values = ref_values(kind)
+        rows = [
+            [InlineKeyboardButton(v[:55], callback_data=f"refdelete|{kind}|{i}")]
+            for i, v in enumerate(values[:40])
+        ]
+        await q.edit_message_text(
+            "Выберите запись для удаления:",
+            reply_markup=InlineKeyboardMarkup(rows or [[InlineKeyboardButton("Список пуст", callback_data="noop|0")]]),
+        )
+    elif action == "refdelete":
+        kind, index = parts[1], int(parts[2])
+        deleted = delete_ref(kind, index)
+        await q.edit_message_text(f"✅ Удалено: {deleted}")
+        await q.message.reply_text("Выберите действие:", reply_markup=menu())
+        context.user_data.clear()
+    elif action == "noop":
+        return
 
 
-def build_application() -> Application:
-    app = Application.builder().token(TOKEN).build()
-    conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", show_menu),
-            CommandHandler("new", start),
-            MessageHandler(filters.Regex(r"^(Новый отчет|🚜 Новый отчет)$"), start),
-            MessageHandler(filters.Regex(r"^(Изменить отчет|✏️ Изменить отчет)$"), edit_report_start),
-        ],
-        states={
-            MACHINE: [CallbackQueryHandler(machine_selected, pattern=r"^machine\|")],
-            DATE: [CallbackQueryHandler(date_selected, pattern=r"^date\|")],
-            DATE_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_manual)],
-            DRIVER: [MessageHandler(filters.TEXT & ~filters.COMMAND, driver)],
-            OBJECT_COUNT: [CallbackQueryHandler(object_count_selected, pattern=r"^objcount\|")],
-            OBJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, object_name)],
-            CUSTOMER: [MessageHandler(filters.TEXT & ~filters.COMMAND, customer)],
-            OBJECT_TRIP_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, object_trip_rate)],
-            OBJECT_TRIPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, object_trips)],
-            START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_time)],
-            END_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, end_time)],
-            RATE_TYPE: [CallbackQueryHandler(rate_type_selected, pattern=r"^rate_type\|")],
-            RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rate)],
-            GLOBAL_TRIPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, global_trips)],
-            PAYMENT: [CallbackQueryHandler(payment_selected, pattern=r"^payment\|")],
-            NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, note)],
-            CONFIRM: [CallbackQueryHandler(confirm, pattern=r"^confirm\|")],
-            EDIT_SELECT_REPORT: [CallbackQueryHandler(edit_report_selected, pattern=r"^editrow\|")],
-            EDIT_SELECT_FIELD: [CallbackQueryHandler(edit_field_selected, pattern=r"^editfield\|")],
-            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_received)],
-            EDIT_PAYMENT: [CallbackQueryHandler(edit_payment_selected, pattern=r"^editpayment\|")],
-            EDIT_RATE_TYPE: [CallbackQueryHandler(edit_rate_type_selected, pattern=r"^editratetype\|")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
+async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data
+    step = d.get("step")
+    value = update.message.text.strip()
+    if not step:
+        await update.message.reply_text("Нажмите /start.", reply_markup=menu())
+        return
+
+    try:
+        if step == "date_manual":
+            datetime.strptime(value, "%d.%m.%Y")
+            d["work_date"] = value
+            await ask_ref(update.message, context, "drivers", "driver")
+        elif step == "start_time":
+            if not valid_time(value):
+                raise ValueError("Неверное время")
+            d["start"] = value
+            d["step"] = "end_time"
+            await update.message.reply_text("Введите время окончания ЧЧ:ММ или «-»:")
+        elif step == "end_time":
+            if not valid_time(value):
+                raise ValueError("Неверное время")
+            d["end"] = value
+            d["hours"] = work_hours(d["start"], value)
+            if d["category"] == "special":
+                await ask_ref(update.message, context, "objects", "special_object")
+            else:
+                d["step"] = "object_count"
+                await update.message.reply_text(
+                    "Сколько объектов?",
+                    reply_markup=buttons(["1", "2", "3", "4"], "objcount"),
+                )
+        elif step == "rate":
+            d["rate"] = number_or_dash(value)
+            await ask_payment(update, context)
+        elif step == "rate_trip":
+            d["rate_trip"] = number_or_dash(value)
+            d["step"] = "trips"
+            await update.message.reply_text("Введите количество рейсов или «-»:")
+        elif step == "trips":
+            d["trips"] = number_or_dash(value)
+            await ask_payment(update, context)
+        elif step == "dump_rate":
+            d["current"]["rate_trip"] = number_or_dash(value)
+            d["step"] = "dump_trips"
+            await update.message.reply_text("Введите количество рейсов или «-»:")
+        elif step == "dump_trips":
+            d["current"]["trips"] = number_or_dash(value)
+            d["step"] = "dump_volume"
+            await update.message.reply_text("Введите объём кузова, м³, или «-»:")
+        elif step == "dump_volume":
+            d["current"]["volume"] = number_or_dash(value)
+            current = d["current"]
+            current["total_volume"] = (
+                "-"
+                if "-" in (current["trips"], current["volume"])
+                else round(float(current["trips"]) * float(current["volume"]), 2)
+            )
+            d["objects"].append(current)
+            if d["object_index"] < d["object_count"]:
+                d["object_index"] += 1
+                await ask_ref(update.message, context, "objects", "dump_object")
+            else:
+                await ask_payment(update, context)
+        elif step == "note":
+            d["note"] = "" if value == "-" else value
+            if d["category"] == "special":
+                d["amount"] = calc_special(d)
+            else:
+                d["total_trips"], d["total_volume"], d["amount"] = calc_dump(d["objects"])
+            d["step"] = "confirm"
+            await update.message.reply_text(
+                summary(d), reply_markup=buttons(["Сохранить", "Отменить"], "confirm")
+            )
+        elif step == "edit_command":
+            col_s, new_value = value.split("=", 1)
+            col = int(col_s)
+            special, dump, _ = initialize_sheets()
+            ws = special if d["edit_sheet"] == "special" else dump
+            ws.update_cell(d["edit_row"], col, new_value.strip())
+            await update.message.reply_text("✅ Ячейка изменена.", reply_markup=menu())
+            context.user_data.clear()
+        elif step in {"add_ref_value", "manage_add_ref_value"}:
+            kind = d["add_ref_kind"]
+            ok, result = add_ref(kind, value)
+            if not ok:
+                await update.message.reply_text(result)
+                return
+            if step == "add_ref_value":
+                await update.message.reply_text(f"✅ Добавлено: {result}")
+                await after_ref_selected(update.message, context, kind, result)
+            else:
+                await update.message.reply_text(f"✅ Добавлено: {result}", reply_markup=menu())
+                context.user_data.clear()
+    except Exception as exc:
+        await update.message.reply_text(f"Ошибка: {exc}. Попробуйте ещё раз.")
+
+
+async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["step"] = "payment"
+    await update.effective_message.reply_text(
+        "Выберите статус оплаты:",
+        reply_markup=buttons(PAYMENT_STATUSES, "payment"),
     )
-    app.add_handler(CommandHandler("version", version_command), group=-1)
-    app.add_handler(conversation, group=0)
-    app.add_error_handler(error_handler)
+
+
+def summary(d):
+    base = (
+        f"Дата: {d['work_date']}\n"
+        f"Техника: {d['name']} | {d['model']} | {d['plate']}\n"
+        f"Водитель: {d['driver']}\n"
+        f"Время: {d['start']}–{d['end']}\n"
+        f"Рабочее время: {d['hours']}"
+    )
+    if d["category"] == "special":
+        return (
+            base
+            + f"\nОбъект: {d['object']}"
+            + f"\nЗаказчик: {d['customer'] or '—'}"
+            + f"\nВид ставки: {d['rate_type']}"
+            + f"\nСтавка: {d.get('rate', '-')}"
+            + f"\nСтавка за рейс: {d.get('rate_trip', '-')}"
+            + f"\nРейс: {d.get('trips', '-')}"
+            + f"\nСумма: {d['amount']}"
+        )
+    lines = []
+    for i, obj in enumerate(d["objects"], 1):
+        lines.append(
+            f"{i}. {obj['object']} | {obj['customer'] or '—'} | "
+            f"ставка {obj['rate_trip']} | рейсы {obj['trips']} | "
+            f"кузов {obj['volume']} м³ | объём {obj['total_volume']} м³"
+        )
+    return (
+        base
+        + "\n"
+        + "\n".join(lines)
+        + f"\nВсего рейсов: {d['total_trips']}"
+        + f"\nОбщий объём: {d['total_volume']} м³"
+        + f"\nСумма: {d['amount']}"
+    )
+
+
+async def save_current_report(q, context):
+    d = context.user_data
+    special, dump, _ = initialize_sheets()
+    user = q.from_user
+    if d["category"] == "special":
+        row = [
+            d["work_date"],
+            d["name"],
+            d["model"],
+            d["plate"],
+            d["driver"],
+            d["object"],
+            d["customer"],
+            d["start"],
+            d["end"],
+            d["hours"],
+            d["rate_type"],
+            d.get("rate", "-"),
+            d.get("rate_trip", "-"),
+            d.get("trips", "-"),
+            d["amount"],
+            d["payment"],
+            d["note"],
+            datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            user.full_name,
+            f"@{user.username}" if user.username else "",
+            str(q.message.chat.id),
+        ]
+        row_num = save_row(special, row)
+        tab = SHEET_SPECIAL
+    else:
+        row = [
+            d["work_date"],
+            d["name"],
+            d["model"],
+            d["plate"],
+            d["driver"],
+            d["start"],
+            d["end"],
+            d["hours"],
+        ]
+        for i in range(4):
+            if i < len(d["objects"]):
+                obj = d["objects"][i]
+                row.extend(
+                    [
+                        obj["object"],
+                        obj["customer"],
+                        obj["rate_trip"],
+                        obj["trips"],
+                        obj["volume"],
+                        obj["total_volume"],
+                    ]
+                )
+            else:
+                row.extend(["", "", "", "", "", ""])
+        row.extend(
+            [
+                d["total_trips"],
+                d["total_volume"],
+                d["amount"],
+                d["payment"],
+                d["note"],
+                datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                user.full_name,
+                f"@{user.username}" if user.username else "",
+                str(q.message.chat.id),
+            ]
+        )
+        row_num = save_row(dump, row)
+        tab = SHEET_DUMP
+    await q.edit_message_text(f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}")
+    await q.message.reply_text("Выберите действие:", reply_markup=menu())
+    context.user_data.clear()
+
+
+async def edit_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data.update(flow="edit", step="edit_sheet")
+    await update.effective_message.reply_text(
+        "Выберите вкладку:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Спецтехника", callback_data="editsheet|special")],
+                [InlineKeyboardButton("Самосвалы", callback_data="editsheet|dump")],
+            ]
+        ),
+    )
+
+
+async def show_edit_rows(q, context, sheet_code):
+    context.user_data["edit_sheet"] = sheet_code
+    special, dump, _ = initialize_sheets()
+    ws = special if sheet_code == "special" else dump
+    rows = ws.get_all_values()
+    keyboard = []
+    for row_num in range(len(rows), 1, -1):
+        row = rows[row_num - 1]
+        if row and row[0].strip():
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{row[0]} | {row[3] if len(row) > 3 else ''} | "
+                        f"{row[4] if len(row) > 4 else ''}"[:60],
+                        callback_data=f"editrow|{row_num}",
+                    )
+                ]
+            )
+        if len(keyboard) >= 20:
+            break
+    await q.edit_message_text(
+        "Выберите строку:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+def build():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("new", start))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("version", version))
+    app.add_handler(MessageHandler(filters.Regex(r"^🚜 Спецтехника$"), begin_special))
+    app.add_handler(MessageHandler(filters.Regex(r"^🚛 Самосвалы$"), begin_dump))
+    app.add_handler(MessageHandler(filters.Regex(r"^✏️ Изменить отчет$"), edit_begin))
+    app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Справочники$"), refs_begin))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
     return app
 
 
 if __name__ == "__main__":
-    logger.info("Запуск Telegram-бота. Версия: %s", BOT_VERSION)
-    build_application().run_polling(drop_pending_updates=False)
+    logger.info("Запуск бота %s", BOT_VERSION)
+    initialize_sheets()
+    build().run_polling(drop_pending_updates=False)
