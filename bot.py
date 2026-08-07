@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.5-dump-customer-filter"
+BOT_VERSION = "5.6-customer-filter-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -128,6 +128,7 @@ DUMP_HEADERS.extend(
         "Пользователь Telegram",
         "Username Telegram",
         "Chat ID",
+        "Заказчики (фильтр)",
     ]
 )
 
@@ -380,18 +381,66 @@ def migrate_dump_remove_time_columns(ws) -> None:
 
 
 def setup_dump_customer_filter(ws) -> None:
-    """Включает стандартный фильтр Google Sheets для всей таблицы Самосвалы.
+    """Надёжный фильтр для вкладки Самосвалы.
 
-    После этого в заголовках Заказчик 1..4 появляются фильтры, через которые
-    можно оставлять строки только нужного заказчика. Фильтр задаётся на весь
-    диапазон таблицы и сохраняется в Google Sheets.
+    В колонке «Заказчики (фильтр)» собираются Заказчик 1..4 в одну строку.
+    Поэтому можно отфильтровать все отчёты конкретного заказчика независимо
+    от того, в каком из четырёх блоков он указан.
+
+    В Google Sheets: значок фильтра -> Фильтр по условию -> Текст содержит.
     """
-    last_col = col_letter(len(DUMP_HEADERS))
+    helper_col = len(DUMP_HEADERS)
+    helper_letter = col_letter(helper_col)
+
+    # После удаления временных колонок:
+    # G = Заказчик 1, M = Заказчик 2, S = Заказчик 3, Y = Заказчик 4.
+    formula = (
+        '=ARRAYFORMULA(IF(A2:A="","",'
+        'G2:G'
+        '&IF((G2:G<>"")*(M2:M<>"")," | ","")&M2:M'
+        '&IF(((G2:G<>"")+(M2:M<>""))*(S2:S<>"")," | ","")&S2:S'
+        '&IF(((G2:G<>"")+(M2:M<>"")+(S2:S<>""))*(Y2:Y<>"")," | ","")&Y2:Y'
+        '))'
+    )
+
     try:
-        ws.set_basic_filter(f"A1:{last_col}{ws.row_count}")
-        logger.info("Во вкладке Самосвалы включён фильтр по колонкам, включая Заказчик 1-4")
+        current_formula = ws.acell(
+            f"{helper_letter}2",
+            value_render_option="FORMULA"
+        ).value or ""
+        if current_formula != formula:
+            ws.update(
+                f"{helper_letter}2",
+                [[formula]],
+                value_input_option="USER_ENTERED",
+            )
+
+        # Ставим/заменяем basic filter напрямую через Sheets API.
+        # Это надёжнее ws.set_basic_filter() на уже существующей таблице.
+        requests = [
+            {"clearBasicFilter": {"sheetId": ws.id}},
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": ws.row_count,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(DUMP_HEADERS),
+                        }
+                    }
+                }
+            },
+        ]
+        ws.spreadsheet.batch_update({"requests": requests})
+        logger.info(
+            "Во вкладке Самосвалы включён общий фильтр; "
+            "заказчики собраны в колонку %s",
+            helper_letter,
+        )
     except Exception:
-        logger.exception("Не удалось включить фильтр во вкладке Самосвалы")
+        logger.exception("Не удалось настроить фильтр заказчиков во вкладке Самосвалы")
 
 
 def initialize_sheets(force: bool = False):
@@ -1235,6 +1284,7 @@ async def save_current_report(q, context):
                 user.full_name,
                 f"@{user.username}" if user.username else "",
                 str(q.message.chat.id),
+                "",  # Заказчики (фильтр) заполняется ARRAYFORMULA
             ]
         )
         row_num = save_row(dump, row)
