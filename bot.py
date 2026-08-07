@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.7-customer-filter-text"
+BOT_VERSION = "5.8-individual-customer-filters"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -393,15 +393,22 @@ def build_customer_filter_text(objects: list[dict[str, Any]]) -> str:
     return " | ".join(result)
 
 
-def setup_dump_customer_filter(ws) -> None:
-    """Настраивает рабочий фильтр заказчиков без формул."""
+def setup_dump_customer_filter(ws, customers_ws=None) -> None:
+    """Настраивает отдельный фильтр для каждого заказчика.
+
+    В служебной колонке «Заказчики (фильтр)» хранится обычный текст со всеми
+    заказчиками строки. Дополнительно создаются отдельные Filter Views Google
+    Sheets с названиями «Заказчик: <название>». Каждый такой фильтр показывает
+    все строки, где встречается именно выбранный заказчик — независимо от того,
+    записан он как Заказчик 1, 2, 3 или 4.
+    """
     helper_col = len(DUMP_HEADERS)
     helper_letter = col_letter(helper_col)
 
     try:
         rows = ws.get_all_values()
 
-        # Для уже существующих отчётов заполняем последнюю колонку обычным текстом.
+        # Заполняем служебную колонку для уже существующих отчетов.
         # После удаления колонок времени:
         # G(7), M(13), S(19), Y(25) = Заказчик 1..4.
         if len(rows) > 1:
@@ -422,7 +429,6 @@ def setup_dump_customer_filter(ws) -> None:
                 text = " | ".join(customers)
                 old_value = padded[helper_col - 1].strip() if len(padded) >= helper_col else ""
                 values.append([text])
-
                 if old_value != text:
                     changed = True
 
@@ -433,6 +439,7 @@ def setup_dump_customer_filter(ws) -> None:
                     value_input_option="USER_ENTERED",
                 )
 
+        # Обычный фильтр на всю таблицу тоже оставляем.
         requests = [
             {"clearBasicFilter": {"sheetId": ws.id}},
             {
@@ -449,10 +456,67 @@ def setup_dump_customer_filter(ws) -> None:
                 }
             },
         ]
+
+        # Получаем сохраненных заказчиков.
+        customers = []
+        if customers_ws is not None:
+            for value in customers_ws.col_values(1)[1:]:
+                value = " ".join((value or "").strip().split())
+                if value and normalize(value) not in {normalize(x) for x in customers}:
+                    customers.append(value)
+
+        # Удаляем старые созданные ботом Filter Views, чтобы не плодить дубли.
+        try:
+            metadata = ws.spreadsheet.fetch_sheet_metadata()
+            for sheet_meta in metadata.get("sheets", []):
+                props = sheet_meta.get("properties", {})
+                if props.get("sheetId") != ws.id:
+                    continue
+                for view in sheet_meta.get("filterViews", []) or []:
+                    title = (view.get("title") or "").strip()
+                    if title.startswith("Заказчик: "):
+                        requests.append(
+                            {"deleteFilterView": {"filterId": view["filterViewId"]}}
+                        )
+        except Exception:
+            logger.exception("Не удалось прочитать существующие Filter Views")
+
+        # Создаем отдельное представление для каждого заказчика.
+        # Критерий применяется к служебной колонке и ищет точное имя как часть текста.
+        for customer in customers:
+            requests.append(
+                {
+                    "addFilterView": {
+                        "filter": {
+                            "title": f"Заказчик: {customer}"[:100],
+                            "range": {
+                                "sheetId": ws.id,
+                                "startRowIndex": 0,
+                                "endRowIndex": ws.row_count,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": len(DUMP_HEADERS),
+                            },
+                            "criteria": {
+                                str(helper_col - 1): {
+                                    "condition": {
+                                        "type": "TEXT_CONTAINS",
+                                        "values": [{"userEnteredValue": customer}],
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            )
+
+        # Один batch-запрос вместо множества отдельных обращений к API.
         ws.spreadsheet.batch_update({"requests": requests})
-        logger.info("Фильтр заказчиков во вкладке Самосвалы настроен")
+        logger.info(
+            "Созданы индивидуальные фильтры заказчиков: %s",
+            len(customers),
+        )
     except Exception:
-        logger.exception("Не удалось настроить фильтр заказчиков во вкладке Самосвалы")
+        logger.exception("Не удалось настроить индивидуальные фильтры заказчиков")
 
 
 def initialize_sheets(force: bool = False):
@@ -472,12 +536,12 @@ def initialize_sheets(force: bool = False):
     except gspread.WorksheetNotFound:
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
-    setup_dump_customer_filter(dump)
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
     objects_ws = ensure_sheet(sp, SHEET_OBJECTS, DIRECTORY_HEADERS["objects"], 500)
     customers_ws = ensure_sheet(sp, SHEET_CUSTOMERS, DIRECTORY_HEADERS["customers"], 500)
+    setup_dump_customer_filter(dump, customers_ws)
     equipment_ws = ensure_sheet(sp, SHEET_EQUIPMENT, EQUIPMENT_HEADERS, 200)
     driver_map = ensure_sheet(sp, SHEET_DRIVER_MAP, DRIVER_MAP_HEADERS, 300)
     _DIRECTORY_SHEETS = {"drivers": drivers_ws, "objects": objects_ws, "customers": customers_ws}
