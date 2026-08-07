@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.4-dump-no-time"
+BOT_VERSION = "5.5-dump-customer-filter"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -379,6 +379,21 @@ def migrate_dump_remove_time_columns(ws) -> None:
         logger.info("Во вкладке Самосвалы удалены колонки Начало, Окончание и Рабочее время")
 
 
+def setup_dump_customer_filter(ws) -> None:
+    """Включает стандартный фильтр Google Sheets для всей таблицы Самосвалы.
+
+    После этого в заголовках Заказчик 1..4 появляются фильтры, через которые
+    можно оставлять строки только нужного заказчика. Фильтр задаётся на весь
+    диапазон таблицы и сохраняется в Google Sheets.
+    """
+    last_col = col_letter(len(DUMP_HEADERS))
+    try:
+        ws.set_basic_filter(f"A1:{last_col}{ws.row_count}")
+        logger.info("Во вкладке Самосвалы включён фильтр по колонкам, включая Заказчик 1-4")
+    except Exception:
+        logger.exception("Не удалось включить фильтр во вкладке Самосвалы")
+
+
 def initialize_sheets(force: bool = False):
     global _SHEET_CACHE, _DIRECTORY_SHEETS
     if _SHEET_CACHE is not None and not force:
@@ -396,6 +411,7 @@ def initialize_sheets(force: bool = False):
     except gspread.WorksheetNotFound:
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
+    setup_dump_customer_filter(dump)
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
