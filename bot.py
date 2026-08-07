@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.3-dump-volume-rate"
+BOT_VERSION = "5.4-dump-no-time"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -105,9 +105,6 @@ DUMP_HEADERS = [
     "Модель",
     "Гос. номер",
     "Машинист / водитель",
-    "Начало",
-    "Окончание",
-    "Рабочее время, ч",
 ]
 for i in range(1, 5):
     DUMP_HEADERS.extend(
@@ -374,6 +371,14 @@ def setup_dashboard(ws, kind: str) -> None:
     )
 
 
+def migrate_dump_remove_time_columns(ws) -> None:
+    """Однократно удаляет из вкладки Самосвалы старые колонки Начало/Окончание/Рабочее время."""
+    headers = ws.row_values(1)
+    if len(headers) >= 8 and headers[5:8] == ["Начало", "Окончание", "Рабочее время, ч"]:
+        ws.delete_columns(6, 8)
+        logger.info("Во вкладке Самосвалы удалены колонки Начало, Окончание и Рабочее время")
+
+
 def initialize_sheets(force: bool = False):
     global _SHEET_CACHE, _DIRECTORY_SHEETS
     if _SHEET_CACHE is not None and not force:
@@ -385,6 +390,11 @@ def initialize_sheets(force: bool = False):
         sp.worksheet("Отчеты").update_title(SHEET_SPECIAL)
 
     special = ensure_sheet(sp, SHEET_SPECIAL, SPECIAL_HEADERS)
+    try:
+        dump_existing = sp.worksheet(SHEET_DUMP)
+        migrate_dump_remove_time_columns(dump_existing)
+    except gspread.WorksheetNotFound:
+        pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
@@ -760,8 +770,15 @@ async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: 
     next_step = d.get("ref_next_step")
     if kind == "drivers":
         d["driver"] = value
-        d["step"] = "start_time"
-        await message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
+        if d.get("category") == "dump":
+            d["step"] = "object_count"
+            await message.reply_text(
+                "Сколько объектов?",
+                reply_markup=buttons(["1", "2", "3", "4"], "objcount"),
+            )
+        else:
+            d["step"] = "start_time"
+            await message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
     elif kind == "objects":
         if d["category"] == "special":
             d["object"] = value
@@ -808,9 +825,16 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "machdriver":
         assigned = drivers_for_plate(d["plate"])
         d["driver"] = assigned[int(parts[1])][0]
-        d["step"] = "start_time"
         await q.edit_message_text(f"Выбран водитель: {d['driver']}")
-        await q.message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
+        if d.get("category") == "dump":
+            d["step"] = "object_count"
+            await q.message.reply_text(
+                "Сколько объектов?",
+                reply_markup=buttons(["1", "2", "3", "4"], "objcount"),
+            )
+        else:
+            d["step"] = "start_time"
+            await q.message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
     elif action == "driverother":
         await q.edit_message_text("Выберите водителя из общего списка.")
         await ask_ref(q.message, context, "drivers", "driver")
@@ -946,10 +970,17 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(result)
                 return
             d["driver"] = result
-            d["step"] = "start_time"
-            await update.message.reply_text(
-                f"✅ Водитель добавлен и выбран: {result}\nВведите время начала ЧЧ:ММ или «-»:"
-            )
+            if d.get("category") == "dump":
+                d["step"] = "object_count"
+                await update.message.reply_text(
+                    f"✅ Водитель добавлен и выбран: {result}\nСколько объектов?",
+                    reply_markup=buttons(["1", "2", "3", "4"], "objcount"),
+                )
+            else:
+                d["step"] = "start_time"
+                await update.message.reply_text(
+                    f"✅ Водитель добавлен и выбран: {result}\nВведите время начала ЧЧ:ММ или «-»:"
+                )
         elif step == "start_time":
             if not valid_time(value):
                 raise ValueError("Неверное время")
@@ -1090,11 +1121,13 @@ def summary(d):
     base = (
         f"Дата: {d['work_date']}\n"
         f"Техника: {d['name']} | {d['model']} | {d['plate']}\n"
-        f"Водитель: {d['driver']}\n"
-        f"Время: {d['start']}–{d['end']}\n"
-        f"Рабочее время: {d['hours']}"
+        f"Водитель: {d['driver']}"
     )
     if d["category"] == "special":
+        base += (
+            f"\nВремя: {d['start']}–{d['end']}"
+            f"\nРабочее время: {d['hours']}"
+        )
         return (
             base
             + f"\nОбъект: {d['object']}"
@@ -1159,9 +1192,6 @@ async def save_current_report(q, context):
             d["model"],
             d["plate"],
             d["driver"],
-            d["start"],
-            d["end"],
-            d["hours"],
         ]
         for i in range(4):
             if i < len(d["objects"]):
