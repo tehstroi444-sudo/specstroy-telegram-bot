@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.6-customer-filter-fixed"
+BOT_VERSION = "5.7-customer-filter-text"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -380,43 +380,59 @@ def migrate_dump_remove_time_columns(ws) -> None:
         logger.info("Во вкладке Самосвалы удалены колонки Начало, Окончание и Рабочее время")
 
 
+def build_customer_filter_text(objects: list[dict[str, Any]]) -> str:
+    """Собирает уникальных заказчиков отчёта в одну строку для фильтра."""
+    result = []
+    seen = set()
+    for item in objects:
+        customer = str(item.get("customer", "") or "").strip()
+        key = normalize(customer)
+        if customer and key not in seen:
+            result.append(customer)
+            seen.add(key)
+    return " | ".join(result)
+
+
 def setup_dump_customer_filter(ws) -> None:
-    """Надёжный фильтр для вкладки Самосвалы.
-
-    В колонке «Заказчики (фильтр)» собираются Заказчик 1..4 в одну строку.
-    Поэтому можно отфильтровать все отчёты конкретного заказчика независимо
-    от того, в каком из четырёх блоков он указан.
-
-    В Google Sheets: значок фильтра -> Фильтр по условию -> Текст содержит.
-    """
+    """Настраивает рабочий фильтр заказчиков без формул."""
     helper_col = len(DUMP_HEADERS)
     helper_letter = col_letter(helper_col)
 
-    # После удаления временных колонок:
-    # G = Заказчик 1, M = Заказчик 2, S = Заказчик 3, Y = Заказчик 4.
-    formula = (
-        '=ARRAYFORMULA(IF(A2:A="","",'
-        'G2:G'
-        '&IF((G2:G<>"")*(M2:M<>"")," | ","")&M2:M'
-        '&IF(((G2:G<>"")+(M2:M<>""))*(S2:S<>"")," | ","")&S2:S'
-        '&IF(((G2:G<>"")+(M2:M<>"")+(S2:S<>""))*(Y2:Y<>"")," | ","")&Y2:Y'
-        '))'
-    )
-
     try:
-        current_formula = ws.acell(
-            f"{helper_letter}2",
-            value_render_option="FORMULA"
-        ).value or ""
-        if current_formula != formula:
-            ws.update(
-                f"{helper_letter}2",
-                [[formula]],
-                value_input_option="USER_ENTERED",
-            )
+        rows = ws.get_all_values()
 
-        # Ставим/заменяем basic filter напрямую через Sheets API.
-        # Это надёжнее ws.set_basic_filter() на уже существующей таблице.
+        # Для уже существующих отчётов заполняем последнюю колонку обычным текстом.
+        # После удаления колонок времени:
+        # G(7), M(13), S(19), Y(25) = Заказчик 1..4.
+        if len(rows) > 1:
+            values = []
+            changed = False
+            for row in rows[1:]:
+                padded = row + [""] * max(0, helper_col - len(row))
+                customers = []
+                seen = set()
+
+                for idx in (6, 12, 18, 24):
+                    customer = padded[idx].strip() if idx < len(padded) else ""
+                    key = normalize(customer)
+                    if customer and key not in seen:
+                        customers.append(customer)
+                        seen.add(key)
+
+                text = " | ".join(customers)
+                old_value = padded[helper_col - 1].strip() if len(padded) >= helper_col else ""
+                values.append([text])
+
+                if old_value != text:
+                    changed = True
+
+            if changed:
+                ws.update(
+                    f"{helper_letter}2:{helper_letter}{len(rows)}",
+                    values,
+                    value_input_option="USER_ENTERED",
+                )
+
         requests = [
             {"clearBasicFilter": {"sheetId": ws.id}},
             {
@@ -434,11 +450,7 @@ def setup_dump_customer_filter(ws) -> None:
             },
         ]
         ws.spreadsheet.batch_update({"requests": requests})
-        logger.info(
-            "Во вкладке Самосвалы включён общий фильтр; "
-            "заказчики собраны в колонку %s",
-            helper_letter,
-        )
+        logger.info("Фильтр заказчиков во вкладке Самосвалы настроен")
     except Exception:
         logger.exception("Не удалось настроить фильтр заказчиков во вкладке Самосвалы")
 
@@ -1284,7 +1296,7 @@ async def save_current_report(q, context):
                 user.full_name,
                 f"@{user.username}" if user.username else "",
                 str(q.message.chat.id),
-                "",  # Заказчики (фильтр) заполняется ARRAYFORMULA
+                build_customer_filter_text(d["objects"]),
             ]
         )
         row_num = save_row(dump, row)
