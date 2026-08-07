@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.2-search-directories"
+BOT_VERSION = "5.3-dump-volume-rate"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -624,12 +624,19 @@ def calc_dump(objects: list[dict[str, Any]]):
         if trips != "-":
             total_trips += float(trips)
             has_t = True
+
+        object_volume = None
         if trips != "-" and volume != "-":
-            total_volume += float(trips) * float(volume)
+            object_volume = float(trips) * float(volume)
+            total_volume += object_volume
             has_v = True
-        if trips != "-" and rate_trip != "-":
-            total_amount += float(trips) * float(rate_trip)
+
+        # Для самосвалов стоимость считается по перевезённому объёму:
+        # общий объём по объекту × ставка.
+        if object_volume is not None and rate_trip != "-":
+            total_amount += object_volume * float(rate_trip)
             has_a = True
+
     return (
         round(total_trips, 2) if has_t else "-",
         round(total_volume, 2) if has_v else "-",
