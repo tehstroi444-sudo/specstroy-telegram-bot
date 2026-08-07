@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.1-assigned-drivers-quota"
+BOT_VERSION = "5.2-search-directories"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -35,7 +35,11 @@ SHEET_SPECIAL = "Спецтехника"
 SHEET_DUMP = "Самосвалы"
 SHEET_OSAGO = "ОСАГО"
 SHEET_DIAG = "Диагностические карты"
-SHEET_REFS = "Справочники"
+SHEET_REFS = "Справочники"  # старая вкладка используется только для миграции
+SHEET_DRIVERS = "Водители"
+SHEET_OBJECTS = "Объекты"
+SHEET_CUSTOMERS = "Заказчики"
+SHEET_EQUIPMENT = "Техника"
 SHEET_DRIVER_MAP = "Водители техники"
 
 SPECIAL_EQUIPMENT = [
@@ -162,8 +166,16 @@ DIAG_HEADERS = [
 ]
 
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
-REF_COLUMNS = {"drivers": 1, "objects": 2, "customers": 3}
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
+DIRECTORY_SHEETS = {"drivers": SHEET_DRIVERS, "objects": SHEET_OBJECTS, "customers": SHEET_CUSTOMERS}
+DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект"], "customers": ["Заказчик"]}
+EQUIPMENT_HEADERS = ["Категория", "Модель", "Гос. номер"]
+LEGACY_OBJECT_NAMES = {
+    "земляные работы", "разработка котлована", "погрузка грунта", "вывоз грунта",
+    "доставка материалов", "планировка территории", "перевозка техники",
+    "работа крана", "работа манипулятора", "другое",
+}
+
 
 DEFAULT_DRIVER_ROWS = [
     ("CAT 434E №1", "3151 МК 50", "Сайдаев М.", "Да"),
@@ -188,6 +200,7 @@ DRIVER_MAP_HEADERS = ["Модель", "Гос. номер", "Водитель", 
 _SHEET_CACHE = None
 _REF_CACHE = {"drivers": None, "objects": None, "customers": None}
 _DRIVER_CACHE = {}
+_DIRECTORY_SHEETS = {}
 
 
 def creds() -> Credentials:
@@ -211,39 +224,53 @@ def col_letter(n: int) -> str:
 
 
 def ensure_sheet(spreadsheet, title: str, headers: list[str], rows: int = 1000):
+    created = False
     try:
         ws = spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=title, rows=rows, cols=max(10, len(headers)))
+        created = True
     if ws.col_count < len(headers):
         ws.add_cols(len(headers) - ws.col_count)
-    ws.update(
-        f"A1:{col_letter(len(headers))}1",
-        [headers],
-        value_input_option="USER_ENTERED",
-    )
-    ws.freeze(rows=1)
-    ws.format(
-        f"A1:{col_letter(len(headers))}1",
-        {
-            "backgroundColor": {"red": 0.08, "green": 0.28, "blue": 0.48},
-            "textFormat": {
-                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                "bold": True,
+    current_headers = ws.row_values(1)
+    if current_headers[:len(headers)] != headers:
+        ws.update(
+            f"A1:{col_letter(len(headers))}1",
+            [headers],
+            value_input_option="USER_ENTERED",
+        )
+    if created or current_headers[:len(headers)] != headers:
+        ws.freeze(rows=1)
+        ws.format(
+            f"A1:{col_letter(len(headers))}1",
+            {
+                "backgroundColor": {"red": 0.08, "green": 0.28, "blue": 0.48},
+                "textFormat": {
+                    "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                    "bold": True,
+                },
+                "horizontalAlignment": "CENTER",
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
             },
-            "horizontalAlignment": "CENTER",
-            "verticalAlignment": "MIDDLE",
-            "wrapStrategy": "WRAP",
-        },
-    )
+        )
     return ws
-
 
 def setup_document_sheet(ws, kind: str) -> None:
     if kind == "osago":
         last_col, end_col, days_col, status_col = "N", 9, 10, 13
     else:
         last_col, end_col, days_col, status_col = "K", 8, 9, 10
+
+    # Если формулы уже установлены, повторно сотни ячеек не переписываем.
+    dcol = col_letter(days_col)
+    scol = col_letter(status_col)
+    existing_a2 = ws.acell("A2", value_render_option="FORMULA").value or ""
+    existing_days = ws.acell(f"{dcol}2", value_render_option="FORMULA").value or ""
+    existing_status = ws.acell(f"{scol}2", value_render_option="FORMULA").value or ""
+    formulas_ready = all(str(x).startswith("=") for x in (existing_a2, existing_days, existing_status))
+    if formulas_ready:
+        return
 
     try:
         ws.set_basic_filter(f"A1:{last_col}500")
@@ -267,8 +294,6 @@ def setup_document_sheet(ws, kind: str) -> None:
         )
 
     ws.update("A2:A501", [[x[0]] for x in rows], value_input_option="USER_ENTERED")
-    dcol = col_letter(days_col)
-    scol = col_letter(status_col)
     ws.update(f"{dcol}2:{dcol}501", [[x[1]] for x in rows], value_input_option="USER_ENTERED")
     ws.update(f"{scol}2:{scol}501", [[x[2]] for x in rows], value_input_option="USER_ENTERED")
 
@@ -319,6 +344,8 @@ def setup_dashboard(ws, kind: str) -> None:
         start_col, status_col = "P", "M"
     else:
         start_col, status_col = "M", "J"
+    if (ws.acell(start_col + "1").value or "").strip() == "Сводка":
+        return
     start_num = gspread.utils.a1_to_rowcol(start_col + "1")[1]
     required_cols = start_num + 1
     if ws.col_count < required_cols:
@@ -348,7 +375,7 @@ def setup_dashboard(ws, kind: str) -> None:
 
 
 def initialize_sheets(force: bool = False):
-    global _SHEET_CACHE
+    global _SHEET_CACHE, _DIRECTORY_SHEETS
     if _SHEET_CACHE is not None and not force:
         return _SHEET_CACHE
 
@@ -361,15 +388,27 @@ def initialize_sheets(force: bool = False):
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
-    refs = ensure_sheet(sp, SHEET_REFS, REF_HEADERS, 500)
+    drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
+    objects_ws = ensure_sheet(sp, SHEET_OBJECTS, DIRECTORY_HEADERS["objects"], 500)
+    customers_ws = ensure_sheet(sp, SHEET_CUSTOMERS, DIRECTORY_HEADERS["customers"], 500)
+    equipment_ws = ensure_sheet(sp, SHEET_EQUIPMENT, EQUIPMENT_HEADERS, 200)
     driver_map = ensure_sheet(sp, SHEET_DRIVER_MAP, DRIVER_MAP_HEADERS, 300)
+    _DIRECTORY_SHEETS = {"drivers": drivers_ws, "objects": objects_ws, "customers": customers_ws}
 
-    # Тяжёлое оформление выполняется только один раз за запуск процесса.
+    # Документные вкладки оформляем только один раз за процесс.
     setup_document_sheet(osago, "osago")
     setup_dashboard(osago, "osago")
     setup_document_sheet(diag, "diag")
     setup_dashboard(diag, "diag")
 
+    # Список техники заполняется один раз.
+    if len(equipment_ws.get_all_values()) <= 1:
+        equipment_rows = [list(x) for x in (SPECIAL_EQUIPMENT + DUMP_EQUIPMENT)]
+        equipment_ws.update(
+            f"A2:C{len(equipment_rows)+1}", equipment_rows, value_input_option="USER_ENTERED"
+        )
+
+    # Привязки водителей заполняются один раз.
     if len(driver_map.get_all_values()) <= 1:
         driver_map.update(
             f"A2:D{len(DEFAULT_DRIVER_ROWS)+1}",
@@ -377,20 +416,38 @@ def initialize_sheets(force: bool = False):
             value_input_option="USER_ENTERED",
         )
 
-    # Добавляем водителей в общий справочник одним пакетным запросом, без дублей.
-    existing = {normalize(v) for v in refs.col_values(1)[1:] if v.strip()}
+    # Миграция старой вкладки «Справочники» в отдельные вкладки.
+    if SHEET_REFS in titles:
+        old_refs = sp.worksheet(SHEET_REFS)
+        old_rows = old_refs.get_all_values()
+        for kind, col_idx in (("drivers", 0), ("objects", 1), ("customers", 2)):
+            current = {normalize(v) for v in _DIRECTORY_SHEETS[kind].col_values(1)[1:] if v.strip()}
+            additions = []
+            for row in old_rows[1:]:
+                if len(row) <= col_idx or not row[col_idx].strip():
+                    continue
+                value = " ".join(row[col_idx].strip().split())
+                if kind == "objects" and normalize(value) in LEGACY_OBJECT_NAMES:
+                    continue
+                if normalize(value) not in current:
+                    additions.append([value]); current.add(normalize(value))
+            if additions:
+                first = first_empty_row(_DIRECTORY_SHEETS[kind], 1)
+                _DIRECTORY_SHEETS[kind].update(
+                    f"A{first}:A{first+len(additions)-1}", additions, value_input_option="USER_ENTERED"
+                )
+
+    # Базовые водители добавляются в отдельную вкладку одним запросом.
+    existing = {normalize(v) for v in drivers_ws.col_values(1)[1:] if v.strip()}
     missing = [[row[2]] for row in DEFAULT_DRIVER_ROWS if normalize(row[2]) not in existing]
     if missing:
-        first = first_empty_row(refs, 1)
-        refs.update(
-            f"A{first}:A{first+len(missing)-1}",
-            missing,
-            value_input_option="USER_ENTERED",
+        first = first_empty_row(drivers_ws, 1)
+        drivers_ws.update(
+            f"A{first}:A{first+len(missing)-1}", missing, value_input_option="USER_ENTERED"
         )
 
-    _SHEET_CACHE = (special, dump, refs, driver_map)
+    _SHEET_CACHE = (special, dump, None, driver_map)
     return _SHEET_CACHE
-
 
 def first_empty_row(ws, column: int = 1) -> int:
     values = ws.col_values(column)
@@ -415,24 +472,45 @@ def ref_values(kind: str) -> list[str]:
     cached = _REF_CACHE.get(kind)
     if cached is not None:
         return list(cached)
-    _, _, refs, _ = initialize_sheets()
-    col = REF_COLUMNS[kind]
-    values = [v.strip() for v in refs.col_values(col)[1:] if v.strip()]
-    _REF_CACHE[kind] = values
-    return list(values)
+    initialize_sheets()
+    ws = _DIRECTORY_SHEETS[kind]
+    values = [v.strip() for v in ws.col_values(1)[1:] if v.strip()]
+    if kind == "objects":
+        values = [v for v in values if normalize(v) not in LEGACY_OBJECT_NAMES]
+    # Удаляем дубли, сохраняя порядок.
+    result, seen = [], set()
+    for v in values:
+        key = normalize(v)
+        if key not in seen:
+            result.append(v); seen.add(key)
+    _REF_CACHE[kind] = result
+    return list(result)
+
+
+def search_ref_values(kind: str, query: str, limit: int = 12) -> list[str]:
+    q = normalize(query)
+    if not q:
+        return []
+    values = ref_values(kind)
+    exact = [v for v in values if normalize(v) == q]
+    starts = [v for v in values if normalize(v).startswith(q) and normalize(v) != q]
+    contains = [v for v in values if q in normalize(v) and not normalize(v).startswith(q)]
+    return (exact + starts + contains)[:limit]
 
 
 def add_ref(kind: str, value: str) -> tuple[bool, str]:
     value = " ".join(value.strip().split())
     if not value:
         return False, "Пустое значение нельзя добавить."
+    if kind == "objects" and normalize(value) in LEGACY_OBJECT_NAMES:
+        return False, "Это название относится к старому списку видов работ и не может быть объектом."
     values = ref_values(kind)
     if normalize(value) in {normalize(v) for v in values}:
         return False, "Такая запись уже существует."
-    _, _, refs, _ = initialize_sheets()
-    col = REF_COLUMNS[kind]
-    row = first_empty_row(refs, col)
-    refs.update_cell(row, col, value)
+    initialize_sheets()
+    ws = _DIRECTORY_SHEETS[kind]
+    row = first_empty_row(ws, 1)
+    ws.update_cell(row, 1, value)
     _REF_CACHE[kind] = None
     return True, value
 
@@ -441,17 +519,16 @@ def delete_ref(kind: str, index: int) -> str:
     values = ref_values(kind)
     if index < 0 or index >= len(values):
         raise ValueError("Запись не найдена")
-    _, _, refs, _ = initialize_sheets()
-    col = REF_COLUMNS[kind]
+    initialize_sheets()
+    ws = _DIRECTORY_SHEETS[kind]
     target = values[index]
-    column_values = refs.col_values(col)
+    column_values = ws.col_values(1)
     for row, item in enumerate(column_values[1:], start=2):
         if normalize(item) == normalize(target):
-            refs.update_cell(row, col, "")
+            ws.update_cell(row, 1, "")
             _REF_CACHE[kind] = None
             return target
     raise ValueError("Запись не найдена")
-
 
 def drivers_for_plate(plate: str) -> list[tuple[str, bool]]:
     if plate in _DRIVER_CACHE:
@@ -590,15 +667,23 @@ def machine_buttons(items):
     )
 
 
-def ref_keyboard(kind: str, include_none: bool = False):
-    values = ref_values(kind)
-    rows = [
-        [InlineKeyboardButton(v[:55], callback_data=f"refsel|{kind}|{i}")]
-        for i, v in enumerate(values[:40])
-    ]
+def ref_search_keyboard(kind: str, include_none: bool = False):
+    rows = [[InlineKeyboardButton("🔍 Найти", callback_data=f"refsearch|{kind}")]]
+    rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data=f"refadd|{kind}")])
     if include_none:
         rows.append([InlineKeyboardButton("➖ Без заказчика", callback_data=f"refnone|{kind}")])
-    rows.append([InlineKeyboardButton("➕ Добавить", callback_data=f"refadd|{kind}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def ref_results_keyboard(kind: str, values: list[str], include_none: bool = False):
+    rows = [
+        [InlineKeyboardButton(v[:55], callback_data=f"refresult|{kind}|{i}")]
+        for i, v in enumerate(values)
+    ]
+    rows.append([InlineKeyboardButton("🔍 Искать ещё", callback_data=f"refsearch|{kind}")])
+    rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data=f"refadd|{kind}")])
+    if include_none:
+        rows.append([InlineKeyboardButton("➖ Без заказчика", callback_data=f"refnone|{kind}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -611,7 +696,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Версия бота: {BOT_VERSION}\n"
-        "Вкладки: Спецтехника, Самосвалы, ОСАГО, Диагностические карты, Справочники."
+        "Вкладки: Спецтехника, Самосвалы, ОСАГО, Диагностические карты, Водители, Объекты, Заказчики, Техника."
     )
 
 
@@ -654,10 +739,12 @@ async def refs_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_ref(message, context: ContextTypes.DEFAULT_TYPE, kind: str, next_step: str, include_none: bool = False):
     context.user_data["ref_next_step"] = next_step
     context.user_data["ref_kind"] = kind
+    context.user_data["ref_include_none"] = include_none
     context.user_data["step"] = "ref_choice"
+    label = {"drivers": "водителя", "objects": "объект", "customers": "заказчика"}[kind]
     await message.reply_text(
-        f"Выберите: {REF_TITLES[kind]}",
-        reply_markup=ref_keyboard(kind, include_none=include_none),
+        f"Выберите {label}: поиск по сохранённым данным или добавление нового.",
+        reply_markup=ref_search_keyboard(kind, include_none=include_none),
     )
 
 
@@ -762,11 +849,21 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Введите изменение в формате:\nномер_колонки=новое значение\n"
             "Например: 8=09:00\nНомера колонок смотрите в первой строке таблицы."
         )
-    elif action == "refsel":
+    elif action == "refsearch":
+        kind = parts[1]
+        d["ref_kind"] = kind
+        d["step"] = "ref_search_query"
+        prompt = {"drivers": "Введите имя или часть имени водителя:", "objects": "Введите название или часть названия объекта:", "customers": "Введите название или часть названия заказчика:"}[kind]
+        await q.edit_message_text(prompt)
+    elif action == "refresult":
         kind, index = parts[1], int(parts[2])
-        values = ref_values(kind)
-        await q.edit_message_text(f"Выбрано: {values[index]}")
-        await after_ref_selected(q.message, context, kind, values[index])
+        results = d.get("ref_search_results", [])
+        if index >= len(results):
+            await q.edit_message_text("Результаты поиска устарели. Выполните поиск ещё раз.")
+            return
+        selected = results[index]
+        await q.edit_message_text(f"Выбрано: {selected}")
+        await after_ref_selected(q.message, context, kind, selected)
     elif action == "refnone":
         kind = parts[1]
         await q.edit_message_text("Выбрано: без заказчика")
@@ -778,14 +875,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "refs":
         kind = parts[1]
         d["manage_ref_kind"] = kind
-        values = ref_values(kind)
-        text_value = "\n".join(f"{i+1}. {v}" for i, v in enumerate(values)) or "Список пуст."
+        count = len(ref_values(kind))
         await q.edit_message_text(
-            f"{REF_TITLES[kind]}:\n\n{text_value[:3000]}",
+            f"{REF_TITLES[kind]}. Сохранено записей: {count}.",
             reply_markup=InlineKeyboardMarkup(
                 [
+                    [InlineKeyboardButton("🔍 Найти", callback_data=f"refmanagefind|{kind}")],
                     [InlineKeyboardButton("➕ Добавить", callback_data=f"refmanageadd|{kind}")],
-                    [InlineKeyboardButton("🗑 Удалить", callback_data=f"refdelmenu|{kind}")],
+                    [InlineKeyboardButton("🗑 Найти и удалить", callback_data=f"refdelmenu|{kind}")],
                 ]
             ),
         )
@@ -793,20 +890,29 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d["add_ref_kind"] = parts[1]
         d["step"] = "manage_add_ref_value"
         await q.edit_message_text(f"Введите новое значение для «{REF_TITLES[parts[1]]}»:")
+    elif action == "refmanagefind":
+        kind = parts[1]
+        d["manage_ref_kind"] = kind
+        d["step"] = "manage_ref_search"
+        await q.edit_message_text("Введите часть названия для поиска:")
     elif action == "refdelmenu":
         kind = parts[1]
-        values = ref_values(kind)
-        rows = [
-            [InlineKeyboardButton(v[:55], callback_data=f"refdelete|{kind}|{i}")]
-            for i, v in enumerate(values[:40])
-        ]
-        await q.edit_message_text(
-            "Выберите запись для удаления:",
-            reply_markup=InlineKeyboardMarkup(rows or [[InlineKeyboardButton("Список пуст", callback_data="noop|0")]]),
-        )
+        d["manage_ref_kind"] = kind
+        d["step"] = "delete_ref_search"
+        await q.edit_message_text("Введите часть названия записи, которую нужно удалить:")
     elif action == "refdelete":
         kind, index = parts[1], int(parts[2])
-        deleted = delete_ref(kind, index)
+        results = d.get("delete_search_results", [])
+        if index >= len(results):
+            await q.edit_message_text("Результаты поиска устарели. Выполните поиск ещё раз.")
+            return
+        target = results[index]
+        all_values = ref_values(kind)
+        real_index = next((i for i, v in enumerate(all_values) if normalize(v) == normalize(target)), -1)
+        if real_index < 0:
+            await q.edit_message_text("Запись уже отсутствует.")
+            return
+        deleted = delete_ref(kind, real_index)
         await q.edit_message_text(f"✅ Удалено: {deleted}")
         await q.message.reply_text("Выберите действие:", reply_markup=menu())
         context.user_data.clear()
@@ -888,6 +994,49 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await ask_ref(update.message, context, "objects", "dump_object")
             else:
                 await ask_payment(update, context)
+        elif step == "ref_search_query":
+            kind = d["ref_kind"]
+            results = search_ref_values(kind, value)
+            d["ref_search_results"] = results
+            include_none = bool(d.get("ref_include_none"))
+            if not results:
+                d["step"] = "ref_choice"
+                await update.message.reply_text(
+                    "Ничего не найдено. Можно поискать ещё или добавить новую запись.",
+                    reply_markup=ref_search_keyboard(kind, include_none=include_none),
+                )
+            elif len(results) == 1 and normalize(results[0]) == normalize(value):
+                await update.message.reply_text(f"Найдено точное совпадение: {results[0]}")
+                await after_ref_selected(update.message, context, kind, results[0])
+            else:
+                d["step"] = "ref_choice"
+                await update.message.reply_text(
+                    f"Найдено: {len(results)}. Выберите нужное:",
+                    reply_markup=ref_results_keyboard(kind, results, include_none=include_none),
+                )
+        elif step == "manage_ref_search":
+            kind = d["manage_ref_kind"]
+            results = search_ref_values(kind, value)
+            if not results:
+                await update.message.reply_text("Ничего не найдено.", reply_markup=menu())
+                context.user_data.clear()
+            else:
+                await update.message.reply_text(
+                    "Результаты поиска:\n" + "\n".join(f"• {x}" for x in results),
+                    reply_markup=menu(),
+                )
+                context.user_data.clear()
+        elif step == "delete_ref_search":
+            kind = d["manage_ref_kind"]
+            results = search_ref_values(kind, value)
+            d["delete_search_results"] = results
+            d["step"] = "delete_ref_choice"
+            if not results:
+                await update.message.reply_text("Ничего не найдено.", reply_markup=menu())
+                context.user_data.clear()
+            else:
+                rows = [[InlineKeyboardButton(x[:55], callback_data=f"refdelete|{kind}|{i}")] for i, x in enumerate(results)]
+                await update.message.reply_text("Выберите запись для удаления:", reply_markup=InlineKeyboardMarkup(rows))
         elif step == "note":
             d["note"] = "" if value == "-" else value
             if d["category"] == "special":
