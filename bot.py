@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.9.2-dump-total-amount-fixed"
+BOT_VERSION = "6.1.1-diag-updated"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -135,34 +135,77 @@ DUMP_HEADERS.extend(
 
 OSAGO_HEADERS = [
     "№",
-    "Категория",
     "Наименование техники",
     "Модель",
     "Гос. номер",
-    "Страховая компания",
-    "Серия и номер полиса",
     "Дата начала",
     "Дата окончания",
     "Осталось дней",
     "Допущенные водители",
-    "Ограничение",
     "Статус",
     "Примечание",
 ]
 
+OSAGO_EQUIPMENT = [
+    ("Урал NEXT", "С 873 ВС 790"),
+    ("Урал NEXT", "С 918 ВС 790"),
+    ("Урал NEXT", "А 668 МА 790"),
+    ("Урал NEXT", "А 677 МА 790"),
+    ("Урал NEXT", "А 646 МА 790"),
+    ("MAN TGS ТЯГАЧ", "В 777 ЕН 150"),
+    ("MAN TGS 41.440", "У 516 МС 790"),
+    ("MAN TGS 41.440", "У 496 МС 790"),
+    ("MAN TGS 41.400", "Х 333 ВТ 99"),
+    ("MAN TGS 41.400", "С 625 ВУ 550"),
+    ("КамАЗ", "В 727 КН 790"),
+    ("КамАЗ", "В 746 КН 790"),
+    ("КамАЗ", "У 777 КР 190"),
+    ("КамАЗ", "У 695 РУ 790"),
+    ("MAN TGA", "М 999 ХЕ 93"),
+    ("CAT 434E (1)", "3151 МК 50"),
+    ("CAT 444Е (3)", "6314 ХЕ 50"),
+    ("CAT  (4)", "1273ХН 50"),
+    ("CAT 434Е (5)", "1272ХН 50"),
+    ("CAT 444 (6)", "5945 ХТ 50"),
+]
+
+OSAGO_PRESET_DATES = {
+    "А 668 МА 790": ("29.10.2025", "28.10.2026"),
+}
+
 DIAG_HEADERS = [
     "№",
-    "Категория",
     "Наименование техники",
     "Модель",
     "Гос. номер",
-    "Номер диагностической карты",
     "Дата оформления",
-    "Дата окончания",
+    "Срок действия до",
     "Осталось дней",
     "Статус",
     "Примечание",
 ]
+
+DIAG_EQUIPMENT = [
+    ("Урал NEXT", "С 873 ВС 790"),
+    ("Урал NEXT", "С 918 ВС 790"),
+    ("Урал NEXT", "А 668 МА 790"),
+    ("Урал NEXT", "А 677 МА 790"),
+    ("Урал NEXT", "А 646 МА 790"),
+    ("MAN TGS ТЯГАЧ", "В 777 ЕН 150"),
+    ("MAN TGS 41.440", "У 516 МС 790"),
+    ("MAN TGS 41.440", "У 496 МС 790"),
+    ("MAN TGS 41.400", "Х 333 ВТ 99"),
+    ("MAN TGS 41.400", "С 625 ВУ 550"),
+    ("КамАЗ", "В 727 КН 790"),
+    ("КамАЗ", "В 746 КН 790"),
+    ("КамАЗ", "У 777 КР 190"),
+    ("КамАЗ", "У 695 РУ 790"),
+    ("MAN TGA", "М 999 ХЕ 93"),
+]
+
+DIAG_PRESET_DATES = {
+    "А 668 МА 790": ("15.05.2026", "15.05.2027"),
+}
 
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
@@ -270,11 +313,248 @@ def ensure_sheet(spreadsheet, title: str, headers: list[str], rows: int = 1000):
         )
     return ws
 
+def normalize_plate(value: str) -> str:
+    """Нормализует госномер для сопоставления, не меняя отображаемое значение."""
+    return re.sub(r"[^0-9A-ZА-ЯЁ]", "", str(value or "").upper())
+
+
+def migrate_osago_sheet(ws) -> None:
+    """Переводит существующую вкладку ОСАГО на новую структуру без потери нужных полей."""
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return
+
+        old_headers = [str(x).strip() for x in values[0]]
+        if old_headers[:len(OSAGO_HEADERS)] == OSAGO_HEADERS:
+            return
+
+        # Если это старая версия, переносим только оставшиеся нужные поля по названиям.
+        known_old = {
+            "№", "Категория", "Наименование техники", "Модель", "Гос. номер",
+            "Страховая компания", "Серия и номер полиса", "Дата начала",
+            "Дата окончания", "Осталось дней", "Допущенные водители",
+            "Ограничение", "Статус", "Примечание",
+        }
+        if not any(h in known_old for h in old_headers):
+            return
+
+        index = {h: i for i, h in enumerate(old_headers) if h}
+        migrated = []
+        for row in values[1:]:
+            if not any(str(x).strip() for x in row):
+                continue
+            def get(name):
+                i = index.get(name)
+                return row[i] if i is not None and i < len(row) else ""
+
+            migrated.append([
+                get("№"),
+                get("Наименование техники"),
+                get("Модель"),
+                get("Гос. номер"),
+                get("Дата начала"),
+                get("Дата окончания"),
+                get("Осталось дней"),
+                get("Допущенные водители"),
+                get("Статус"),
+                get("Примечание"),
+            ])
+
+        ws.clear()
+        ws.update(
+            f"A1:{col_letter(len(OSAGO_HEADERS))}1",
+            [OSAGO_HEADERS],
+            value_input_option="USER_ENTERED",
+        )
+        if migrated:
+            ws.update(
+                f"A2:{col_letter(len(OSAGO_HEADERS))}{len(migrated)+1}",
+                migrated,
+                value_input_option="USER_ENTERED",
+            )
+        logger.info("Вкладка ОСАГО переведена на новую структуру")
+    except Exception:
+        logger.exception("Не удалось мигрировать вкладку ОСАГО")
+
+
+def seed_osago_equipment(ws) -> None:
+    """Добавляет заданный парк техники в ОСАГО и вносит известные даты страховки."""
+    try:
+        values = ws.get_all_values()
+        rows = values[1:] if len(values) > 1 else []
+
+        # Индекс существующих строк по госномеру.
+        by_plate = {}
+        for idx, row in enumerate(rows, start=2):
+            plate = row[3] if len(row) > 3 else ""
+            if plate:
+                by_plate[normalize_plate(plate)] = idx
+
+        append_rows = []
+        date_updates = []
+
+        for name, plate in OSAGO_EQUIPMENT:
+            key = normalize_plate(plate)
+            preset = OSAGO_PRESET_DATES.get(plate)
+
+            if key in by_plate:
+                row_num = by_plate[key]
+                # Обновляем наименование и госномер в существующей строке.
+                date_updates.append({
+                    "range": f"B{row_num}:D{row_num}",
+                    "values": [[name, "", plate]],
+                })
+                if preset:
+                    date_updates.append({
+                        "range": f"E{row_num}:F{row_num}",
+                        "values": [[preset[0], preset[1]]],
+                    })
+            else:
+                start_date, end_date = preset if preset else ("", "")
+                append_rows.append([
+                    "", name, "", plate, start_date, end_date, "", "", "", ""
+                ])
+
+        if append_rows:
+            first = max(len(rows) + 2, 2)
+            ws.update(
+                f"A{first}:J{first + len(append_rows) - 1}",
+                append_rows,
+                value_input_option="USER_ENTERED",
+            )
+
+        if date_updates:
+            ws.spreadsheet.values_batch_update({
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {"range": f"'{ws.title}'!{item['range']}", "values": item["values"]}
+                    for item in date_updates
+                ],
+            })
+
+        logger.info("Парк ОСАГО синхронизирован: %s единиц", len(OSAGO_EQUIPMENT))
+    except Exception:
+        logger.exception("Не удалось заполнить парк техники во вкладке ОСАГО")
+
+
+def migrate_diag_sheet(ws) -> None:
+    """Переводит вкладку «Диагностические карты» на новую структуру."""
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return
+
+        current_headers = [str(x).strip() for x in values[0]]
+        if current_headers[:len(DIAG_HEADERS)] == DIAG_HEADERS:
+            return
+
+        index = {h: i for i, h in enumerate(current_headers) if h}
+        migrated = []
+
+        for row in values[1:]:
+            if not any(str(x).strip() for x in row):
+                continue
+
+            def get(*names):
+                for name in names:
+                    i = index.get(name)
+                    if i is not None and i < len(row):
+                        return row[i]
+                return ""
+
+            migrated.append([
+                get("№"),
+                get("Наименование техники"),
+                get("Модель"),
+                get("Гос. номер"),
+                get("Дата оформления", "Дата выдачи"),
+                get("Срок действия до", "Дата окончания", "Действует до"),
+                get("Осталось дней"),
+                get("Статус"),
+                get("Примечание"),
+            ])
+
+        ws.clear()
+        ws.update(
+            f"A1:{col_letter(len(DIAG_HEADERS))}1",
+            [DIAG_HEADERS],
+            value_input_option="USER_ENTERED",
+        )
+        if migrated:
+            ws.update(
+                f"A2:{col_letter(len(DIAG_HEADERS))}{len(migrated)+1}",
+                migrated,
+                value_input_option="USER_ENTERED",
+            )
+        logger.info("Вкладка Диагностические карты переведена на новую структуру")
+    except Exception:
+        logger.exception("Не удалось мигрировать вкладку Диагностические карты")
+
+
+def seed_diag_equipment(ws) -> None:
+    """Синхронизирует список техники и известные сроки диагностических карт."""
+    try:
+        values = ws.get_all_values()
+        rows = values[1:] if len(values) > 1 else []
+
+        by_plate = {}
+        for idx, row in enumerate(rows, start=2):
+            plate = row[3] if len(row) > 3 else ""
+            if plate:
+                by_plate[normalize_plate(plate)] = idx
+
+        append_rows = []
+        update_data = []
+
+        for name, plate in DIAG_EQUIPMENT:
+            key = normalize_plate(plate)
+            preset = DIAG_PRESET_DATES.get(plate)
+
+            if key in by_plate:
+                row_num = by_plate[key]
+                update_data.append({
+                    "range": f"B{row_num}:D{row_num}",
+                    "values": [[name, "", plate]],
+                })
+                if preset:
+                    update_data.append({
+                        "range": f"E{row_num}:F{row_num}",
+                        "values": [[preset[0], preset[1]]],
+                    })
+            else:
+                issue_date, valid_to = preset if preset else ("", "")
+                append_rows.append([
+                    "", name, "", plate, issue_date, valid_to, "", "", ""
+                ])
+
+        if append_rows:
+            first_row = len(rows) + 2
+            ws.update(
+                f"A{first_row}:I{first_row + len(append_rows) - 1}",
+                append_rows,
+                value_input_option="USER_ENTERED",
+            )
+
+        if update_data:
+            ws.spreadsheet.values_batch_update({
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {"range": f"'{ws.title}'!{item['range']}", "values": item["values"]}
+                    for item in update_data
+                ],
+            })
+
+        logger.info("Диагностические карты: синхронизировано %s единиц техники", len(DIAG_EQUIPMENT))
+    except Exception:
+        logger.exception("Не удалось заполнить технику во вкладке Диагностические карты")
+
+
 def setup_document_sheet(ws, kind: str) -> None:
     if kind == "osago":
-        last_col, end_col, days_col, status_col = "N", 9, 10, 13
+        last_col, end_col, days_col, status_col = "J", 6, 7, 9
     else:
-        last_col, end_col, days_col, status_col = "K", 8, 9, 10
+        last_col, end_col, days_col, status_col = "I", 6, 7, 8
 
     # Если формулы уже установлены, повторно сотни ячеек не переписываем.
     dcol = col_letter(days_col)
@@ -297,7 +577,7 @@ def setup_document_sheet(ws, kind: str) -> None:
         days_letter = col_letter(days_col)
         rows.append(
             [
-                f'=IF(C{row}="","",ROW()-1)',
+                f'=IF(B{row}="","",ROW()-1)',
                 f'=IF({end_letter}{row}="","",{end_letter}{row}-TODAY())',
                 (
                     f'=IF({end_letter}{row}="","Нет данных",'
@@ -355,9 +635,9 @@ def setup_document_sheet(ws, kind: str) -> None:
 
 def setup_dashboard(ws, kind: str) -> None:
     if kind == "osago":
-        start_col, status_col = "P", "M"
+        start_col, status_col = "L", "I"
     else:
-        start_col, status_col = "M", "J"
+        start_col, status_col = "K", "H"
     if (ws.acell(start_col + "1").value or "").strip() == "Сводка":
         return
     start_num = gspread.utils.a1_to_rowcol(start_col + "1")[1]
@@ -553,8 +833,24 @@ def initialize_sheets(force: bool = False):
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
     recalculate_dump_totals(dump)
+
+    try:
+        osago_existing = sp.worksheet(SHEET_OSAGO)
+        migrate_osago_sheet(osago_existing)
+    except gspread.WorksheetNotFound:
+        pass
+
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
+    seed_osago_equipment(osago)
+
+    try:
+        diag_existing = sp.worksheet(SHEET_DIAG)
+        migrate_diag_sheet(diag_existing)
+    except gspread.WorksheetNotFound:
+        pass
+
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
+    seed_diag_equipment(diag)
     drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
     objects_ws = ensure_sheet(sp, SHEET_OBJECTS, DIRECTORY_HEADERS["objects"], 500)
     customers_ws = ensure_sheet(sp, SHEET_CUSTOMERS, DIRECTORY_HEADERS["customers"], 500)
