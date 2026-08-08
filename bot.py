@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.1.3-ru-formula-fixed"
+BOT_VERSION = "6.1.4-documents-seed-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -379,59 +379,29 @@ def migrate_osago_sheet(ws) -> None:
 
 
 def seed_osago_equipment(ws) -> None:
-    """Компактно размещает технику ОСАГО с 2-й строки и сохраняет введённые данные."""
-    try:
-        values = ws.get_all_values()
-        existing = {}
+    """Записывает парк ОСАГО напрямую в строки 2..N."""
+    rows = []
+    for name, plate in OSAGO_EQUIPMENT:
+        start_date, end_date = OSAGO_PRESET_DATES.get(plate, ("", ""))
+        rows.append([
+            "",
+            name,
+            "",
+            plate,
+            start_date,
+            end_date,
+            "",
+            "",
+            "",
+            "",
+        ])
 
-        # Сохраняем только реальные строки техники, игнорируя сотни служебных формул.
-        for row in values[1:]:
-            padded = row + [""] * max(0, len(OSAGO_HEADERS) - len(row))
-            name = padded[1].strip() if len(padded) > 1 else ""
-            plate = padded[3].strip() if len(padded) > 3 else ""
-            if not name and not plate:
-                continue
-            if plate:
-                existing[normalize_plate(plate)] = padded[:len(OSAGO_HEADERS)]
-
-        rows = []
-        for name, plate in OSAGO_EQUIPMENT:
-            old = existing.get(normalize_plate(plate), [""] * len(OSAGO_HEADERS))
-            old = old + [""] * max(0, len(OSAGO_HEADERS) - len(old))
-
-            start_date = old[4]
-            end_date = old[5]
-            drivers = old[7]
-            note = old[9]
-
-            preset = OSAGO_PRESET_DATES.get(plate)
-            if preset:
-                start_date, end_date = preset
-
-            rows.append([
-                "",               # № — формула
-                name,
-                old[2],           # Модель, если была заполнена вручную
-                plate,
-                start_date,
-                end_date,
-                "",               # Осталось дней — формула
-                drivers,
-                "",               # Статус — формула
-                note,
-            ])
-
-        # Убираем "пустые" служебные строки от старой структуры и пишем парк сверху.
-        ws.batch_clear([f"A2:J{ws.row_count}"])
-        if rows:
-            ws.update(
-                f"A2:J{len(rows)+1}",
-                rows,
-                value_input_option="USER_ENTERED",
-            )
-        logger.info("ОСАГО: техника размещена с 2-й строки, всего %s", len(rows))
-    except Exception:
-        logger.exception("Не удалось заполнить парк техники во вкладке ОСАГО")
+    ws.update(
+        f"A2:J{len(rows)+1}",
+        rows,
+        value_input_option="USER_ENTERED",
+    )
+    logger.info("ОСАГО: записано %s единиц техники", len(rows))
 
 
 def migrate_diag_sheet(ws) -> None:
@@ -489,58 +459,28 @@ def migrate_diag_sheet(ws) -> None:
 
 
 def seed_diag_equipment(ws) -> None:
-    """Компактно размещает технику диагностических карт и сохраняет введённые данные."""
-    try:
-        values = ws.get_all_values()
-        existing = {}
+    """Записывает парк диагностических карт напрямую в строки 2..N."""
+    rows = []
+    for name, plate in DIAG_EQUIPMENT:
+        issue_date, valid_to = DIAG_PRESET_DATES.get(plate, ("", ""))
+        rows.append([
+            "",
+            name,
+            "",
+            plate,
+            issue_date,
+            valid_to,
+            "",
+            "",
+            "",
+        ])
 
-        for row in values[1:]:
-            padded = row + [""] * max(0, len(DIAG_HEADERS) - len(row))
-            name = padded[1].strip() if len(padded) > 1 else ""
-            plate = padded[3].strip() if len(padded) > 3 else ""
-            if not name and not plate:
-                continue
-            if plate:
-                existing[normalize_plate(plate)] = padded[:len(DIAG_HEADERS)]
-
-        rows = []
-        for name, plate in DIAG_EQUIPMENT:
-            old = existing.get(normalize_plate(plate), [""] * len(DIAG_HEADERS))
-            old = old + [""] * max(0, len(DIAG_HEADERS) - len(old))
-
-            issue_date = old[4]
-            valid_to = old[5]
-            note = old[8]
-
-            preset = DIAG_PRESET_DATES.get(plate)
-            if preset:
-                issue_date, valid_to = preset
-
-            rows.append([
-                "",              # № — формула
-                name,
-                old[2],          # Модель, если была заполнена
-                plate,
-                issue_date,
-                valid_to,
-                "",              # Осталось дней — формула
-                "",              # Статус — формула
-                note,
-            ])
-
-        ws.batch_clear([f"A2:I{ws.row_count}"])
-        if rows:
-            ws.update(
-                f"A2:I{len(rows)+1}",
-                rows,
-                value_input_option="USER_ENTERED",
-            )
-        logger.info(
-            "Диагностические карты: техника размещена с 2-й строки, всего %s",
-            len(rows),
-        )
-    except Exception:
-        logger.exception("Не удалось заполнить технику во вкладке Диагностические карты")
+    ws.update(
+        f"A2:I{len(rows)+1}",
+        rows,
+        value_input_option="USER_ENTERED",
+    )
+    logger.info("Диагностические карты: записано %s единиц техники", len(rows))
 
 
 def setup_document_sheet(ws, kind: str) -> None:
@@ -1411,6 +1351,34 @@ async def show_customer_report(message, context: ContextTypes.DEFAULT_TYPE, cust
     context.user_data.clear()
 
 
+async def sync_documents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно заполняет ОСАГО и диагностические карты."""
+    try:
+        sp = book()
+        osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
+        diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
+
+        seed_osago_equipment(osago)
+        seed_diag_equipment(diag)
+        setup_document_sheet(osago, "osago")
+        setup_dashboard(osago, "osago")
+        setup_document_sheet(diag, "diag")
+        setup_dashboard(diag, "diag")
+
+        await update.effective_message.reply_text(
+            f"✅ Документы синхронизированы.\n"
+            f"ОСАГО: {len(OSAGO_EQUIPMENT)} машин.\n"
+            f"Диагностические карты: {len(DIAG_EQUIPMENT)} машин.",
+            reply_markup=menu(),
+        )
+    except Exception as exc:
+        logger.exception("Ошибка синхронизации документов")
+        await update.effective_message.reply_text(
+            f"❌ Ошибка: {type(exc).__name__}: {exc}",
+            reply_markup=menu(),
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     initialize_sheets()
@@ -1984,6 +1952,7 @@ def build():
     app.add_handler(CommandHandler("new", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("version", version))
+    app.add_handler(CommandHandler("syncdocs", sync_documents_command))
     app.add_handler(MessageHandler(filters.Regex(r"^🚜 Спецтехника$"), begin_special))
     app.add_handler(MessageHandler(filters.Regex(r"^🚛 Самосвалы$"), begin_dump))
     app.add_handler(MessageHandler(filters.Regex(r"^🔎 По заказчику$"), customer_search_begin))
