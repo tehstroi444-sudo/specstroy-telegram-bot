@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.1.2-documents-rows-fixed"
+BOT_VERSION = "6.1.3-ru-formula-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -556,9 +556,7 @@ def setup_document_sheet(ws, kind: str) -> None:
     existing_days = ws.acell(f"{dcol}2", value_render_option="FORMULA").value or ""
     existing_status = ws.acell(f"{scol}2", value_render_option="FORMULA").value or ""
     formulas_ready = all(str(x).startswith("=") for x in (existing_a2, existing_days, existing_status))
-    # После перестройки строк формулы могли быть очищены; продолжаем, если A2/B2 содержит технику.
-    if formulas_ready and (ws.acell("B2").value or "").strip():
-        return
+    # Формулы переписываем при запуске: это исправляет старые #ERROR! после смены локали/структуры.
 
     try:
         ws.set_basic_filter(f"A1:{last_col}500")
@@ -571,12 +569,12 @@ def setup_document_sheet(ws, kind: str) -> None:
         days_letter = col_letter(days_col)
         rows.append(
             [
-                f'=IF(B{row}="","",ROW()-1)',
-                f'=IF({end_letter}{row}="","",{end_letter}{row}-TODAY())',
+                f'=IF(B{row}="";"";ROW()-1)',
+                f'=IF({end_letter}{row}="";"";{end_letter}{row}-TODAY())',
                 (
-                    f'=IF({end_letter}{row}="","Нет данных",'
-                    f'IF({days_letter}{row}<0,"Просрочен",'
-                    f'IF({days_letter}{row}<=30,"Заканчивается","Действует")))'
+                    f'=IF({end_letter}{row}="";"Нет данных";'
+                    f'IF({days_letter}{row}<0;"Просрочен";'
+                    f'IF({days_letter}{row}<=30;"Заканчивается";"Действует")))'
                 ),
             ]
         )
@@ -632,8 +630,7 @@ def setup_dashboard(ws, kind: str) -> None:
         start_col, status_col = "L", "I"
     else:
         start_col, status_col = "K", "H"
-    if (ws.acell(start_col + "1").value or "").strip() == "Сводка":
-        return
+    # Сводку переписываем при запуске, чтобы исправлять старые формулы #ERROR!.
     start_num = gspread.utils.a1_to_rowcol(start_col + "1")[1]
     required_cols = start_num + 1
     if ws.col_count < required_cols:
@@ -643,10 +640,10 @@ def setup_dashboard(ws, kind: str) -> None:
         f"{start_col}1:{end_col}5",
         [
             ["Сводка", "Количество"],
-            ["Всего документов", f'=COUNTIF({status_col}2:{status_col},"<>")'],
-            ["Действует", f'=COUNTIF({status_col}2:{status_col},"Действует")'],
-            ["Заканчивается", f'=COUNTIF({status_col}2:{status_col},"Заканчивается")'],
-            ["Просрочен", f'=COUNTIF({status_col}2:{status_col},"Просрочен")'],
+            ["Всего документов", f'=COUNTIF({status_col}2:{status_col};"<>")'],
+            ["Действует", f'=COUNTIF({status_col}2:{status_col};"Действует")'],
+            ["Заканчивается", f'=COUNTIF({status_col}2:{status_col};"Заканчивается")'],
+            ["Просрочен", f'=COUNTIF({status_col}2:{status_col};"Просрочен")'],
         ],
         value_input_option="USER_ENTERED",
     )
