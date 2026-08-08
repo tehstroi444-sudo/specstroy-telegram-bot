@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.9.1-customer-search-fixed"
+BOT_VERSION = "5.9.2-dump-total-amount-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -122,7 +122,7 @@ DUMP_HEADERS.extend(
     [
         "Всего рейсов",
         "Общий объём, м³",
-        "Сумма, ₽",
+        "Общая сумма, ₽",
         "Статус оплаты",
         "Примечание",
         "Дата и время сохранения",
@@ -552,6 +552,7 @@ def initialize_sheets(force: bool = False):
     except gspread.WorksheetNotFound:
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
+    recalculate_dump_totals(dump)
     osago = ensure_sheet(sp, SHEET_OSAGO, OSAGO_HEADERS, 600)
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
@@ -793,13 +794,16 @@ def calc_dump(objects: list[dict[str, Any]]):
             has_t = True
 
         object_volume = None
-        if trips != "-" and volume != "-":
+        if obj.get("total_volume") not in (None, "", "-"):
+            object_volume = float(obj["total_volume"])
+        elif trips != "-" and volume != "-":
             object_volume = float(trips) * float(volume)
+
+        if object_volume is not None:
             total_volume += object_volume
             has_v = True
 
-        # Для самосвалов стоимость считается по перевезённому объёму:
-        # общий объём по объекту × ставка.
+        # Общая сумма по объекту = общий объём × ставка.
         if object_volume is not None and rate_trip != "-":
             total_amount += object_volume * float(rate_trip)
             has_a = True
@@ -809,6 +813,76 @@ def calc_dump(objects: list[dict[str, Any]]):
         round(total_volume, 2) if has_v else "-",
         round(total_amount, 2) if has_a else "-",
     )
+
+
+def recalculate_dump_totals(ws) -> None:
+    """Пересчитывает итоговые колонки Самосвалов для всех существующих строк."""
+    try:
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return
+
+        updates = []
+        changed = False
+
+        for row in rows[1:]:
+            padded = row + [""] * max(0, len(DUMP_HEADERS) - len(row))
+
+            total_trips = 0.0
+            total_volume = 0.0
+            total_amount = 0.0
+            has_trips = False
+            has_volume = False
+            has_amount = False
+
+            for i in range(4):
+                base = 5 + i * 6
+                rate = padded[base + 2]
+                trips = padded[base + 3]
+                body_volume = padded[base + 4]
+                object_total_volume = padded[base + 5]
+
+                trips_num = _to_float(trips)
+                body_num = _to_float(body_volume)
+                rate_num = _to_float(rate)
+                volume_num = _to_float(object_total_volume)
+
+                if str(trips).strip() not in ("", "-"):
+                    total_trips += trips_num
+                    has_trips = True
+
+                if str(object_total_volume).strip() in ("", "-") and trips_num and body_num:
+                    volume_num = trips_num * body_num
+
+                if volume_num:
+                    total_volume += volume_num
+                    has_volume = True
+
+                if volume_num and str(rate).strip() not in ("", "-"):
+                    total_amount += volume_num * rate_num
+                    has_amount = True
+
+            new_values = [
+                round(total_trips, 2) if has_trips else "-",
+                round(total_volume, 2) if has_volume else "-",
+                round(total_amount, 2) if has_amount else "-",
+            ]
+
+            old_values = padded[29:32]  # AD:AF
+            if [str(x) for x in old_values] != [str(x) for x in new_values]:
+                changed = True
+
+            updates.append(new_values)
+
+        if changed:
+            ws.update(
+                f"AD2:AF{len(rows)}",
+                updates,
+                value_input_option="USER_ENTERED",
+            )
+            logger.info("Пересчитаны итоги вкладки Самосвалы: %s строк", len(updates))
+    except Exception:
+        logger.exception("Не удалось пересчитать итоги вкладки Самосвалы")
 
 
 def menu():
