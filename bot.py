@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.1.1-diag-updated"
+BOT_VERSION = "6.1.2-documents-rows-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -379,61 +379,57 @@ def migrate_osago_sheet(ws) -> None:
 
 
 def seed_osago_equipment(ws) -> None:
-    """Добавляет заданный парк техники в ОСАГО и вносит известные даты страховки."""
+    """Компактно размещает технику ОСАГО с 2-й строки и сохраняет введённые данные."""
     try:
         values = ws.get_all_values()
-        rows = values[1:] if len(values) > 1 else []
+        existing = {}
 
-        # Индекс существующих строк по госномеру.
-        by_plate = {}
-        for idx, row in enumerate(rows, start=2):
-            plate = row[3] if len(row) > 3 else ""
+        # Сохраняем только реальные строки техники, игнорируя сотни служебных формул.
+        for row in values[1:]:
+            padded = row + [""] * max(0, len(OSAGO_HEADERS) - len(row))
+            name = padded[1].strip() if len(padded) > 1 else ""
+            plate = padded[3].strip() if len(padded) > 3 else ""
+            if not name and not plate:
+                continue
             if plate:
-                by_plate[normalize_plate(plate)] = idx
+                existing[normalize_plate(plate)] = padded[:len(OSAGO_HEADERS)]
 
-        append_rows = []
-        date_updates = []
-
+        rows = []
         for name, plate in OSAGO_EQUIPMENT:
-            key = normalize_plate(plate)
+            old = existing.get(normalize_plate(plate), [""] * len(OSAGO_HEADERS))
+            old = old + [""] * max(0, len(OSAGO_HEADERS) - len(old))
+
+            start_date = old[4]
+            end_date = old[5]
+            drivers = old[7]
+            note = old[9]
+
             preset = OSAGO_PRESET_DATES.get(plate)
+            if preset:
+                start_date, end_date = preset
 
-            if key in by_plate:
-                row_num = by_plate[key]
-                # Обновляем наименование и госномер в существующей строке.
-                date_updates.append({
-                    "range": f"B{row_num}:D{row_num}",
-                    "values": [[name, "", plate]],
-                })
-                if preset:
-                    date_updates.append({
-                        "range": f"E{row_num}:F{row_num}",
-                        "values": [[preset[0], preset[1]]],
-                    })
-            else:
-                start_date, end_date = preset if preset else ("", "")
-                append_rows.append([
-                    "", name, "", plate, start_date, end_date, "", "", "", ""
-                ])
+            rows.append([
+                "",               # № — формула
+                name,
+                old[2],           # Модель, если была заполнена вручную
+                plate,
+                start_date,
+                end_date,
+                "",               # Осталось дней — формула
+                drivers,
+                "",               # Статус — формула
+                note,
+            ])
 
-        if append_rows:
-            first = max(len(rows) + 2, 2)
+        # Убираем "пустые" служебные строки от старой структуры и пишем парк сверху.
+        ws.batch_clear([f"A2:J{ws.row_count}"])
+        if rows:
             ws.update(
-                f"A{first}:J{first + len(append_rows) - 1}",
-                append_rows,
+                f"A2:J{len(rows)+1}",
+                rows,
                 value_input_option="USER_ENTERED",
             )
-
-        if date_updates:
-            ws.spreadsheet.values_batch_update({
-                "valueInputOption": "USER_ENTERED",
-                "data": [
-                    {"range": f"'{ws.title}'!{item['range']}", "values": item["values"]}
-                    for item in date_updates
-                ],
-            })
-
-        logger.info("Парк ОСАГО синхронизирован: %s единиц", len(OSAGO_EQUIPMENT))
+        logger.info("ОСАГО: техника размещена с 2-й строки, всего %s", len(rows))
     except Exception:
         logger.exception("Не удалось заполнить парк техники во вкладке ОСАГО")
 
@@ -493,59 +489,56 @@ def migrate_diag_sheet(ws) -> None:
 
 
 def seed_diag_equipment(ws) -> None:
-    """Синхронизирует список техники и известные сроки диагностических карт."""
+    """Компактно размещает технику диагностических карт и сохраняет введённые данные."""
     try:
         values = ws.get_all_values()
-        rows = values[1:] if len(values) > 1 else []
+        existing = {}
 
-        by_plate = {}
-        for idx, row in enumerate(rows, start=2):
-            plate = row[3] if len(row) > 3 else ""
+        for row in values[1:]:
+            padded = row + [""] * max(0, len(DIAG_HEADERS) - len(row))
+            name = padded[1].strip() if len(padded) > 1 else ""
+            plate = padded[3].strip() if len(padded) > 3 else ""
+            if not name and not plate:
+                continue
             if plate:
-                by_plate[normalize_plate(plate)] = idx
+                existing[normalize_plate(plate)] = padded[:len(DIAG_HEADERS)]
 
-        append_rows = []
-        update_data = []
-
+        rows = []
         for name, plate in DIAG_EQUIPMENT:
-            key = normalize_plate(plate)
+            old = existing.get(normalize_plate(plate), [""] * len(DIAG_HEADERS))
+            old = old + [""] * max(0, len(DIAG_HEADERS) - len(old))
+
+            issue_date = old[4]
+            valid_to = old[5]
+            note = old[8]
+
             preset = DIAG_PRESET_DATES.get(plate)
+            if preset:
+                issue_date, valid_to = preset
 
-            if key in by_plate:
-                row_num = by_plate[key]
-                update_data.append({
-                    "range": f"B{row_num}:D{row_num}",
-                    "values": [[name, "", plate]],
-                })
-                if preset:
-                    update_data.append({
-                        "range": f"E{row_num}:F{row_num}",
-                        "values": [[preset[0], preset[1]]],
-                    })
-            else:
-                issue_date, valid_to = preset if preset else ("", "")
-                append_rows.append([
-                    "", name, "", plate, issue_date, valid_to, "", "", ""
-                ])
+            rows.append([
+                "",              # № — формула
+                name,
+                old[2],          # Модель, если была заполнена
+                plate,
+                issue_date,
+                valid_to,
+                "",              # Осталось дней — формула
+                "",              # Статус — формула
+                note,
+            ])
 
-        if append_rows:
-            first_row = len(rows) + 2
+        ws.batch_clear([f"A2:I{ws.row_count}"])
+        if rows:
             ws.update(
-                f"A{first_row}:I{first_row + len(append_rows) - 1}",
-                append_rows,
+                f"A2:I{len(rows)+1}",
+                rows,
                 value_input_option="USER_ENTERED",
             )
-
-        if update_data:
-            ws.spreadsheet.values_batch_update({
-                "valueInputOption": "USER_ENTERED",
-                "data": [
-                    {"range": f"'{ws.title}'!{item['range']}", "values": item["values"]}
-                    for item in update_data
-                ],
-            })
-
-        logger.info("Диагностические карты: синхронизировано %s единиц техники", len(DIAG_EQUIPMENT))
+        logger.info(
+            "Диагностические карты: техника размещена с 2-й строки, всего %s",
+            len(rows),
+        )
     except Exception:
         logger.exception("Не удалось заполнить технику во вкладке Диагностические карты")
 
@@ -563,7 +556,8 @@ def setup_document_sheet(ws, kind: str) -> None:
     existing_days = ws.acell(f"{dcol}2", value_render_option="FORMULA").value or ""
     existing_status = ws.acell(f"{scol}2", value_render_option="FORMULA").value or ""
     formulas_ready = all(str(x).startswith("=") for x in (existing_a2, existing_days, existing_status))
-    if formulas_ready:
+    # После перестройки строк формулы могли быть очищены; продолжаем, если A2/B2 содержит технику.
+    if formulas_ready and (ws.acell("B2").value or "").strip():
         return
 
     try:
