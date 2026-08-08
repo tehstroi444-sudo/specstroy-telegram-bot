@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.8-individual-customer-filters"
+BOT_VERSION = "5.9-customer-search-report"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -39,6 +39,7 @@ SHEET_REFS = "Справочники"  # старая вкладка испол�
 SHEET_DRIVERS = "Водители"
 SHEET_OBJECTS = "Объекты"
 SHEET_CUSTOMERS = "Заказчики"
+SHEET_CUSTOMER_REPORT = "Поиск заказчика"
 SHEET_EQUIPMENT = "Техника"
 SHEET_DRIVER_MAP = "Водители техники"
 
@@ -167,6 +168,21 @@ REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
 DIRECTORY_SHEETS = {"drivers": SHEET_DRIVERS, "objects": SHEET_OBJECTS, "customers": SHEET_CUSTOMERS}
 DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект"], "customers": ["Заказчик"]}
+
+CUSTOMER_REPORT_HEADERS = [
+    "Дата",
+    "Техника",
+    "Модель",
+    "Гос. номер",
+    "Водитель",
+    "Объект",
+    "Заказчик",
+    "Ставка, ₽/м³",
+    "Рейсы",
+    "Объём кузова, м³",
+    "Общий объём, м³",
+    "Сумма, ₽",
+]
 EQUIPMENT_HEADERS = ["Категория", "Модель", "Гос. номер"]
 LEGACY_OBJECT_NAMES = {
     "земляные работы", "разработка котлована", "погрузка грунта", "вывоз грунта",
@@ -799,6 +815,7 @@ def menu():
     return ReplyKeyboardMarkup(
         [
             ["🚜 Спецтехника", "🚛 Самосвалы"],
+            ["🔎 По заказчику"],
             ["✏️ Изменить отчет", "⚙️ Справочники"],
         ],
         resize_keyboard=True,
@@ -845,6 +862,184 @@ def ref_results_keyboard(kind: str, values: list[str], include_none: bool = Fals
     return InlineKeyboardMarkup(rows)
 
 
+def _to_float(value: Any) -> float:
+    text = str(value or "").strip().replace(" ", "").replace(",", ".")
+    if not text or text == "-":
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def build_customer_report(customer: str):
+    """Ищет заказчика одновременно в Заказчик 1..4 и возвращает детальные строки."""
+    _, dump, _, _ = initialize_sheets()
+    rows = dump.get_all_values()
+    target = normalize(customer)
+    result = []
+
+    for row in rows[1:]:
+        if not row or not str(row[0]).strip():
+            continue
+
+        padded = row + [""] * max(0, len(DUMP_HEADERS) - len(row))
+
+        # Базовые поля A:E
+        work_date = padded[0]
+        name = padded[1]
+        model = padded[2]
+        plate = padded[3]
+        driver = padded[4]
+
+        # Каждый объект занимает 6 колонок:
+        # Объект, Заказчик, Ставка, Рейсы, Объем кузова, Общий объем.
+        for i in range(4):
+            base = 5 + i * 6
+            obj = padded[base]
+            row_customer = padded[base + 1]
+            rate = padded[base + 2]
+            trips = padded[base + 3]
+            body_volume = padded[base + 4]
+            total_volume = padded[base + 5]
+
+            if normalize(row_customer) != target:
+                continue
+
+            # Для выбранного заказчика считаем только его конкретный блок.
+            amount = _to_float(total_volume) * _to_float(rate)
+
+            result.append(
+                {
+                    "date": work_date,
+                    "name": name,
+                    "model": model,
+                    "plate": plate,
+                    "driver": driver,
+                    "object": obj,
+                    "customer": row_customer,
+                    "rate": rate,
+                    "trips": trips,
+                    "body_volume": body_volume,
+                    "total_volume": total_volume,
+                    "amount": round(amount, 2),
+                }
+            )
+
+    return result
+
+
+def write_customer_report_sheet(customer: str, items: list[dict[str, Any]]) -> None:
+    """Записывает результат поиска в отдельную вкладку одним пакетным обновлением."""
+    sp = open_spreadsheet()
+    ws = ensure_sheet(sp, SHEET_CUSTOMER_REPORT, CUSTOMER_REPORT_HEADERS, 500)
+
+    # Очищаем только данные, оставляя заголовок.
+    if ws.row_count > 1:
+        ws.batch_clear([f"A2:L{ws.row_count}"])
+
+    rows = []
+    total_trips = 0.0
+    total_volume = 0.0
+    total_amount = 0.0
+
+    for item in items:
+        trips = _to_float(item["trips"])
+        volume = _to_float(item["total_volume"])
+        amount = _to_float(item["amount"])
+        total_trips += trips
+        total_volume += volume
+        total_amount += amount
+
+        rows.append(
+            [
+                item["date"],
+                item["name"],
+                item["model"],
+                item["plate"],
+                item["driver"],
+                item["object"],
+                item["customer"],
+                item["rate"],
+                item["trips"],
+                item["body_volume"],
+                item["total_volume"],
+                item["amount"],
+            ]
+        )
+
+    if rows:
+        ws.update(
+            f"A2:L{len(rows) + 1}",
+            rows,
+            value_input_option="USER_ENTERED",
+        )
+
+    summary_row = len(rows) + 3
+    ws.update(
+        f"A{summary_row}:D{summary_row + 3}",
+        [
+            ["Заказчик", customer, "", ""],
+            ["Всего рейсов", round(total_trips, 2), "", ""],
+            ["Общий объём, м³", round(total_volume, 2), "", ""],
+            ["Общая сумма, ₽", round(total_amount, 2), "", ""],
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+
+async def customer_search_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data.update(flow="customer_report")
+    await ask_ref(
+        update.effective_message,
+        context,
+        "customers",
+        "customer_report",
+        include_none=False,
+    )
+
+
+async def show_customer_report(message, context: ContextTypes.DEFAULT_TYPE, customer: str):
+    items = build_customer_report(customer)
+    write_customer_report_sheet(customer, items)
+
+    if not items:
+        await message.reply_text(
+            f"По заказчику «{customer}» рейсы не найдены.",
+            reply_markup=menu(),
+        )
+        context.user_data.clear()
+        return
+
+    total_trips = sum(_to_float(x["trips"]) for x in items)
+    total_volume = sum(_to_float(x["total_volume"]) for x in items)
+    total_amount = sum(_to_float(x["amount"]) for x in items)
+
+    lines = [
+        f"🏢 Заказчик: {customer}",
+        f"Найдено позиций: {len(items)}",
+        f"Всего рейсов: {round(total_trips, 2)}",
+        f"Общий объём: {round(total_volume, 2)} м³",
+        f"Общая сумма: {round(total_amount, 2):,.2f} ₽".replace(",", " "),
+        "",
+        "Последние записи:",
+    ]
+
+    for item in items[-15:]:
+        lines.append(
+            f"• {item['date']} | {item['plate']} | {item['object']} | "
+            f"{item['trips']} рейс. | {item['total_volume']} м³ | "
+            f"{item['amount']:,.2f} ₽".replace(",", " ")
+        )
+
+    if len(items) > 15:
+        lines.append(f"…ещё {len(items) - 15} позиций смотрите во вкладке «{SHEET_CUSTOMER_REPORT}».")
+
+    await message.reply_text("\n".join(lines), reply_markup=menu())
+    context.user_data.clear()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     initialize_sheets()
@@ -854,7 +1049,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Версия бота: {BOT_VERSION}\n"
-        "Вкладки: Спецтехника, Самосвалы, ОСАГО, Диагностические карты, Водители, Объекты, Заказчики, Техника."
+        "Вкладки: Спецтехника, Самосвалы, Поиск заказчика, ОСАГО, Диагностические карты, Водители, Объекты, Заказчики, Техника."
     )
 
 
@@ -928,7 +1123,9 @@ async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: 
             d["current"] = {"object": value}
             await ask_ref(message, context, "customers", "dump_customer", include_none=True)
     elif kind == "customers":
-        if next_step == "special_customer":
+        if next_step == "customer_report":
+            await show_customer_report(message, context, value)
+        elif next_step == "special_customer":
             d["customer"] = value
             d["step"] = "rate_type"
             await message.reply_text(
@@ -1418,6 +1615,7 @@ def build():
     app.add_handler(CommandHandler("version", version))
     app.add_handler(MessageHandler(filters.Regex(r"^🚜 Спецтехника$"), begin_special))
     app.add_handler(MessageHandler(filters.Regex(r"^🚛 Самосвалы$"), begin_dump))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔎 По заказчику$"), customer_search_begin))
     app.add_handler(MessageHandler(filters.Regex(r"^✏️ Изменить отчет$"), edit_begin))
     app.add_handler(MessageHandler(filters.Regex(r"^⚙️ Справочники$"), refs_begin))
     app.add_handler(CallbackQueryHandler(callback))
