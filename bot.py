@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "5.9-customer-search-report"
+BOT_VERSION = "5.9.1-customer-search-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -931,7 +931,7 @@ def build_customer_report(customer: str):
 
 def write_customer_report_sheet(customer: str, items: list[dict[str, Any]]) -> None:
     """Записывает результат поиска в отдельную вкладку одним пакетным обновлением."""
-    sp = open_spreadsheet()
+    sp = book()
     ws = ensure_sheet(sp, SHEET_CUSTOMER_REPORT, CUSTOMER_REPORT_HEADERS, 500)
 
     # Очищаем только данные, оставляя заголовок.
@@ -1001,8 +1001,18 @@ async def customer_search_begin(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def show_customer_report(message, context: ContextTypes.DEFAULT_TYPE, customer: str):
-    items = build_customer_report(customer)
-    write_customer_report_sheet(customer, items)
+    try:
+        items = build_customer_report(customer)
+        write_customer_report_sheet(customer, items)
+    except Exception as exc:
+        logger.exception("Ошибка поиска по заказчику %s", customer)
+        await message.reply_text(
+            f"Не удалось сформировать отчёт по заказчику «{customer}». "
+            f"Ошибка: {type(exc).__name__}: {exc}",
+            reply_markup=menu(),
+        )
+        context.user_data.clear()
+        return
 
     if not items:
         await message.reply_text(
