@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.1.4-documents-seed-fixed"
+BOT_VERSION = "6.2-reports-edit-prices-formulas"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -92,7 +92,6 @@ SPECIAL_HEADERS = [
     "Ставка за рейс, ₽",
     "Рейс",
     "Сумма, ₽",
-    "Статус оплаты",
     "Примечание",
     "Дата и время сохранения",
     "Пользователь Telegram",
@@ -123,7 +122,6 @@ DUMP_HEADERS.extend(
         "Всего рейсов",
         "Общий объём, м³",
         "Общая сумма, ₽",
-        "Статус оплаты",
         "Примечание",
         "Дата и время сохранения",
         "Пользователь Telegram",
@@ -210,7 +208,7 @@ DIAG_PRESET_DATES = {
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
 DIRECTORY_SHEETS = {"drivers": SHEET_DRIVERS, "objects": SHEET_OBJECTS, "customers": SHEET_CUSTOMERS}
-DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект"], "customers": ["Заказчик"]}
+DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект", "Цена, ₽"], "customers": ["Заказчик"]}
 
 CUSTOMER_REPORT_HEADERS = [
     "Дата",
@@ -607,6 +605,86 @@ def migrate_dump_remove_time_columns(ws) -> None:
         logger.info("Во вкладке Самосвалы удалены колонки Начало, Окончание и Рабочее время")
 
 
+def migrate_remove_payment_status(ws) -> None:
+    """Удаляет старую колонку «Статус оплаты», сохраняя остальные данные."""
+    headers = ws.row_values(1)
+    if "Статус оплаты" in headers:
+        col = headers.index("Статус оплаты") + 1
+        ws.delete_columns(col)
+        logger.info("Во вкладке %s удалена колонка Статус оплаты", ws.title)
+
+
+def special_amount_formula(row: int) -> str:
+    """Формула суммы спецтехники; обновляется при ручном редактировании таблицы."""
+    return (
+        f'=IF(K{row}="-";"-";'
+        f'IF(K{row}="За час";IF(OR(L{row}="-";J{row}="-");"-";L{row}*J{row});'
+        f'IF(K{row}="За рейс";IF(OR(M{row}="-";N{row}="-");"-";M{row}*N{row});'
+        f'IF(L{row}="-";"-";L{row}))))'
+    )
+
+
+def dump_row_formulas(row: int) -> dict[int, str]:
+    """Формулы Самосвалов. Ключ — номер колонки (1-based)."""
+    # Объект 1: H ставка, I рейсы, J кузов, K общий объём
+    # Объект 2: N/O/P/Q; объект 3: T/U/V/W; объект 4: Z/AA/AB/AC
+    formulas = {}
+    blocks = [(8, 9, 10, 11), (14, 15, 16, 17), (20, 21, 22, 23), (26, 27, 28, 29)]
+    for rate_col, trips_col, body_col, total_col in blocks:
+        r = col_letter(trips_col)
+        b = col_letter(body_col)
+        formulas[total_col] = (
+            f'=IF(OR({r}{row}="";{r}{row}="-";{b}{row}="";{b}{row}="-");"-";'
+            f'{r}{row}*{b}{row})'
+        )
+
+    formulas[30] = (
+        f'=IF(COUNTA(I{row};O{row};U{row};AA{row})=0;"-";'
+        f'SUM(I{row};O{row};U{row};AA{row}))'
+    )
+    formulas[31] = (
+        f'=IF(COUNTA(K{row};Q{row};W{row};AC{row})=0;"-";'
+        f'SUM(K{row};Q{row};W{row};AC{row}))'
+    )
+    formulas[32] = (
+        f'=IF(COUNTA(H{row};N{row};T{row};Z{row})=0;"-";'
+        f'IFERROR(K{row}*H{row};0)+IFERROR(Q{row}*N{row};0)+'
+        f'IFERROR(W{row}*T{row};0)+IFERROR(AC{row}*Z{row};0))'
+    )
+    return formulas
+
+
+def apply_report_formulas(special, dump) -> None:
+    """Ставит формулы только на существующие строки отчётов."""
+    try:
+        s_rows = special.get_all_values()
+        if len(s_rows) > 1:
+            formulas = [[special_amount_formula(r)] for r in range(2, len(s_rows) + 1)]
+            special.update(
+                f"O2:O{len(s_rows)}",
+                formulas,
+                value_input_option="USER_ENTERED",
+            )
+
+        d_rows = dump.get_all_values()
+        if len(d_rows) > 1:
+            # 7 производных колонок: K,Q,W,AC,AD,AE,AF.
+            columns = {11: [], 17: [], 23: [], 29: [], 30: [], 31: [], 32: []}
+            for r in range(2, len(d_rows) + 1):
+                f = dump_row_formulas(r)
+                for c in columns:
+                    columns[c].append([f[c]])
+            for c, values in columns.items():
+                letter = col_letter(c)
+                dump.update(
+                    f"{letter}2:{letter}{len(d_rows)}",
+                    values,
+                    value_input_option="USER_ENTERED",
+                )
+    except Exception:
+        logger.exception("Не удалось установить формулы отчётов")
+
+
 def build_customer_filter_text(objects: list[dict[str, Any]]) -> str:
     """Собирает уникальных заказчиков отчёта в одну строку для фильтра."""
     result = []
@@ -756,14 +834,21 @@ def initialize_sheets(force: bool = False):
     if "Отчеты" in titles and SHEET_SPECIAL not in titles:
         sp.worksheet("Отчеты").update_title(SHEET_SPECIAL)
 
+    try:
+        special_existing = sp.worksheet(SHEET_SPECIAL)
+        migrate_remove_payment_status(special_existing)
+    except gspread.WorksheetNotFound:
+        pass
     special = ensure_sheet(sp, SHEET_SPECIAL, SPECIAL_HEADERS)
+
     try:
         dump_existing = sp.worksheet(SHEET_DUMP)
         migrate_dump_remove_time_columns(dump_existing)
+        migrate_remove_payment_status(dump_existing)
     except gspread.WorksheetNotFound:
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
-    recalculate_dump_totals(dump)
+    apply_report_formulas(special, dump)
 
     try:
         osago_existing = sp.worksheet(SHEET_OSAGO)
@@ -908,6 +993,71 @@ def add_ref(kind: str, value: str) -> tuple[bool, str]:
     ws.update_cell(row, 1, value)
     _REF_CACHE[kind] = None
     return True, value
+
+
+def get_object_price(object_name: str) -> float | None:
+    """Возвращает сохранённую цену объекта из вкладки «Объекты»."""
+    initialize_sheets()
+    ws = _DIRECTORY_SHEETS["objects"]
+    rows = ws.get_all_values()
+    target = normalize(object_name)
+    for row in rows[1:]:
+        if row and normalize(row[0]) == target:
+            if len(row) < 2 or not str(row[1]).strip():
+                return None
+            try:
+                return float(str(row[1]).replace(" ", "").replace(",", "."))
+            except ValueError:
+                return None
+    return None
+
+
+def set_object_price(object_name: str, price: float) -> None:
+    """Сохраняет/обновляет цену объекта."""
+    initialize_sheets()
+    ws = _DIRECTORY_SHEETS["objects"]
+    rows = ws.get_all_values()
+    target = normalize(object_name)
+    for row_num, row in enumerate(rows[1:], start=2):
+        if row and normalize(row[0]) == target:
+            ws.update_cell(row_num, 2, price)
+            return
+    row_num = first_empty_row(ws, 1)
+    ws.update(
+        f"A{row_num}:B{row_num}",
+        [[object_name, price]],
+        value_input_option="USER_ENTERED",
+    )
+    _REF_CACHE["objects"] = None
+
+
+async def prompt_special_price(message, context: ContextTypes.DEFAULT_TYPE):
+    """Предлагает сохранённую цену объекта либо ввод новой."""
+    d = context.user_data
+    saved = get_object_price(d.get("object", ""))
+    if d.get("rate_type") == "-":
+        d["rate"] = "-"
+        d["rate_trip"] = "-"
+        d["trips"] = "-"
+        d["step"] = "note"
+        await message.reply_text("Введите примечание или «-»:")
+        return
+
+    d["saved_object_price"] = saved
+    if saved is not None:
+        await message.reply_text(
+            f"Для объекта «{d['object']}» сохранена цена: {saved:g} ₽.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(f"✅ Использовать {saved:g} ₽", callback_data="objprice|use")],
+                    [InlineKeyboardButton("✏️ Изменить цену", callback_data="objprice|change")],
+                ]
+            ),
+        )
+    else:
+        d["step"] = "rate_trip" if d["rate_type"] == "За рейс" else "rate"
+        text = "Введите ставку за рейс или «-»:" if d["rate_type"] == "За рейс" else "Введите ставку или «-»:"
+        await message.reply_text(text)
 
 
 def delete_ref(kind: str, index: int) -> str:
@@ -1524,23 +1674,40 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d["rate_type"] = RATE_TYPES[int(parts[1])]
         if d["rate_type"] == "За рейс":
             d["rate"] = "-"
-            d["step"] = "rate_trip"
-            await q.edit_message_text("Введите ставку за рейс или «-»:")
         else:
             d["rate_trip"] = "-"
             d["trips"] = "-"
-            d["step"] = "rate"
-            await q.edit_message_text("Введите ставку или «-»:")
+        await q.edit_message_text(f"Вид ставки: {d['rate_type']}")
+        await prompt_special_price(q.message, context)
+    elif action == "objprice":
+        choice = parts[1]
+        if choice == "use":
+            price = d.get("saved_object_price")
+            if price is None:
+                await q.edit_message_text("Сохранённая цена не найдена. Введите цену вручную.")
+                d["step"] = "rate_trip" if d["rate_type"] == "За рейс" else "rate"
+                return
+            if d["rate_type"] == "За рейс":
+                d["rate_trip"] = price
+                d["step"] = "trips"
+                await q.edit_message_text(f"Использована цена {price:g} ₽. Введите количество рейсов или «-»:")
+            else:
+                d["rate"] = price
+                d["step"] = "note"
+                await q.edit_message_text(f"Использована цена {price:g} ₽. Введите примечание или «-»:")
+        else:
+            d["step"] = "rate_trip" if d["rate_type"] == "За рейс" else "rate"
+            await q.edit_message_text(
+                "Введите новую ставку за рейс или «-»:"
+                if d["rate_type"] == "За рейс"
+                else "Введите новую ставку или «-»:"
+            )
     elif action == "objcount":
         d["object_count"] = int(parts[1]) + 1
         d["object_index"] = 1
         d["objects"] = []
         await q.edit_message_text("Количество объектов выбрано.")
         await ask_ref(q.message, context, "objects", "dump_object")
-    elif action == "payment":
-        d["payment"] = PAYMENT_STATUSES[int(parts[1])]
-        d["step"] = "note"
-        await q.edit_message_text("Введите примечание или «-»:")
     elif action == "confirm":
         if parts[1] == "1":
             context.user_data.clear()
@@ -1552,11 +1719,19 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_edit_rows(q, context, parts[1])
     elif action == "editrow":
         d["edit_row"] = int(parts[1])
-        d["step"] = "edit_command"
-        await q.edit_message_text(
-            "Введите изменение в формате:\nномер_колонки=новое значение\n"
-            "Например: 8=09:00\nНомера колонок смотрите в первой строке таблицы."
-        )
+        d["step"] = "edit_field"
+        await show_edit_fields(q, context)
+    elif action == "editfield":
+        fields = SPECIAL_EDIT_FIELDS if d["edit_sheet"] == "special" else DUMP_EDIT_FIELDS
+        idx = int(parts[1])
+        if idx >= len(fields):
+            await q.edit_message_text("Поле не найдено.")
+            return
+        label, col = fields[idx]
+        d["edit_col"] = col
+        d["edit_label"] = label
+        d["step"] = "edit_value"
+        await q.edit_message_text(f"Введите новое значение для «{label}»:")
     elif action == "refsearch":
         kind = parts[1]
         d["ref_kind"] = kind
@@ -1679,14 +1854,20 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         elif step == "rate":
             d["rate"] = number_or_dash(value)
-            await ask_payment(update, context)
+            if d["rate"] != "-":
+                set_object_price(d["object"], float(d["rate"]))
+            d["step"] = "note"
+            await update.message.reply_text("Введите примечание или «-»:")
         elif step == "rate_trip":
             d["rate_trip"] = number_or_dash(value)
+            if d["rate_trip"] != "-":
+                set_object_price(d["object"], float(d["rate_trip"]))
             d["step"] = "trips"
             await update.message.reply_text("Введите количество рейсов или «-»:")
         elif step == "trips":
             d["trips"] = number_or_dash(value)
-            await ask_payment(update, context)
+            d["step"] = "note"
+            await update.message.reply_text("Введите примечание или «-»:")
         elif step == "dump_rate":
             d["current"]["rate_trip"] = number_or_dash(value)
             d["step"] = "dump_trips"
@@ -1708,7 +1889,8 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 d["object_index"] += 1
                 await ask_ref(update.message, context, "objects", "dump_object")
             else:
-                await ask_payment(update, context)
+                d["step"] = "note"
+                await update.message.reply_text("Введите примечание или «-»:")
         elif step == "ref_search_query":
             kind = d["ref_kind"]
             results = search_ref_values(kind, value)
@@ -1762,13 +1944,22 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 summary(d), reply_markup=buttons(["Сохранить", "Отменить"], "confirm")
             )
-        elif step == "edit_command":
-            col_s, new_value = value.split("=", 1)
-            col = int(col_s)
+        elif step == "edit_value":
             special, dump, _, _ = initialize_sheets()
             ws = special if d["edit_sheet"] == "special" else dump
-            ws.update_cell(d["edit_row"], col, new_value.strip())
-            await update.message.reply_text("✅ Ячейка изменена.", reply_markup=menu())
+            new_value = value.strip()
+
+            # Базовая проверка времени.
+            if d["edit_sheet"] == "special" and d["edit_col"] in (8, 9) and not valid_time(new_value):
+                raise ValueError("Время нужно вводить ЧЧ:ММ или «-»")
+
+            ws.update_cell(d["edit_row"], d["edit_col"], new_value)
+            recalc_edited_report_row(ws, d["edit_sheet"], d["edit_row"])
+
+            await update.message.reply_text(
+                f"✅ «{d['edit_label']}» изменено. Расчётные поля обновлены автоматически.",
+                reply_markup=menu(),
+            )
             context.user_data.clear()
         elif step in {"add_ref_value", "manage_add_ref_value"}:
             kind = d["add_ref_kind"]
@@ -1785,13 +1976,6 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.message.reply_text(f"Ошибка: {exc}. Попробуйте ещё раз.")
 
-
-async def ask_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["step"] = "payment"
-    await update.effective_message.reply_text(
-        "Выберите статус оплаты:",
-        reply_markup=buttons(PAYMENT_STATUSES, "payment"),
-    )
 
 
 def summary(d):
@@ -1853,7 +2037,6 @@ async def save_current_report(q, context):
             d.get("rate_trip", "-"),
             d.get("trips", "-"),
             d["amount"],
-            d["payment"],
             d["note"],
             datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
             user.full_name,
@@ -1861,6 +2044,7 @@ async def save_current_report(q, context):
             str(q.message.chat.id),
         ]
         row_num = save_row(special, row)
+        special.update_cell(row_num, 15, special_amount_formula(row_num))
         tab = SHEET_SPECIAL
     else:
         row = [
@@ -1890,7 +2074,6 @@ async def save_current_report(q, context):
                 d["total_trips"],
                 d["total_volume"],
                 d["amount"],
-                d["payment"],
                 d["note"],
                 datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
                 user.full_name,
@@ -1900,10 +2083,97 @@ async def save_current_report(q, context):
             ]
         )
         row_num = save_row(dump, row)
+        formulas = dump_row_formulas(row_num)
+        for col, formula in formulas.items():
+            dump.update_cell(row_num, col, formula)
         tab = SHEET_DUMP
     await q.edit_message_text(f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}")
     await q.message.reply_text("Выберите действие:", reply_markup=menu())
     context.user_data.clear()
+
+
+SPECIAL_EDIT_FIELDS = [
+    ("Дата работы", 1),
+    ("Водитель", 5),
+    ("Объект", 6),
+    ("Заказчик", 7),
+    ("Начало", 8),
+    ("Окончание", 9),
+    ("Вид ставки", 11),
+    ("Ставка, ₽", 12),
+    ("Ставка за рейс, ₽", 13),
+    ("Рейс", 14),
+    ("Примечание", 16),
+]
+
+DUMP_EDIT_FIELDS = [
+    ("Дата работы", 1),
+    ("Водитель", 5),
+]
+for _i in range(4):
+    _base = 6 + _i * 6
+    DUMP_EDIT_FIELDS.extend(
+        [
+            (f"Объект {_i+1}", _base),
+            (f"Заказчик {_i+1}", _base + 1),
+            (f"Ставка {_i+1}", _base + 2),
+            (f"Рейсы {_i+1}", _base + 3),
+            (f"Объём кузова {_i+1}", _base + 4),
+        ]
+    )
+DUMP_EDIT_FIELDS.append(("Примечание", 33))
+
+
+def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
+    """После изменения через бота восстанавливает производные значения."""
+    if sheet_code == "special":
+        row = ws.row_values(row_num)
+        row += [""] * max(0, len(SPECIAL_HEADERS) - len(row))
+        start, end = row[7], row[8]
+        if valid_time(start) and valid_time(end):
+            hours = work_hours(start, end)
+            ws.update_cell(row_num, 10, hours)
+        ws.update_cell(row_num, 15, special_amount_formula(row_num))
+
+        # Если изменена цена и объект известен — сохраняем новую цену объекта.
+        obj = row[5].strip()
+        rate_type = row[10].strip()
+        if obj:
+            price_text = row[12] if rate_type == "За рейс" else row[11]
+            if str(price_text).strip() not in ("", "-"):
+                try:
+                    set_object_price(obj, float(str(price_text).replace(" ", "").replace(",", ".")))
+                except ValueError:
+                    pass
+    else:
+        formulas = dump_row_formulas(row_num)
+        for col, formula in formulas.items():
+            ws.update_cell(row_num, col, formula)
+
+        # Обновляем служебную колонку заказчиков после редактирования.
+        row = ws.row_values(row_num)
+        row += [""] * max(0, len(DUMP_HEADERS) - len(row))
+        customers = []
+        seen = set()
+        for idx in (6, 12, 18, 24):  # G,M,S,Y
+            customer = row[idx].strip() if idx < len(row) else ""
+            key = normalize(customer)
+            if customer and key not in seen:
+                customers.append(customer)
+                seen.add(key)
+        ws.update_cell(row_num, 38, " | ".join(customers))
+
+
+async def show_edit_fields(q, context):
+    sheet_code = context.user_data["edit_sheet"]
+    fields = SPECIAL_EDIT_FIELDS if sheet_code == "special" else DUMP_EDIT_FIELDS
+    rows = []
+    for idx, (label, _) in enumerate(fields):
+        rows.append([InlineKeyboardButton(label, callback_data=f"editfield|{idx}")])
+    await q.edit_message_text(
+        "Что именно изменить?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def edit_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
