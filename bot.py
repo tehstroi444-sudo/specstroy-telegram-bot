@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2.2-ruble-currency-format"
+BOT_VERSION = "6.2.3-documents-persistence-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -377,29 +377,86 @@ def migrate_osago_sheet(ws) -> None:
 
 
 def seed_osago_equipment(ws) -> None:
-    """Записывает парк ОСАГО напрямую в строки 2..N."""
-    rows = []
-    for name, plate in OSAGO_EQUIPMENT:
-        start_date, end_date = OSAGO_PRESET_DATES.get(plate, ("", ""))
-        rows.append([
-            "",
-            name,
-            "",
-            plate,
-            start_date,
-            end_date,
-            "",
-            "",
-            "",
-            "",
-        ])
+    """Гарантирует наличие нужной техники в ОСАГО, не стирая введённые данные."""
+    try:
+        values = ws.get_all_values()
+        rows = values[1:] if len(values) > 1 else []
 
-    ws.update(
-        f"A2:J{len(rows)+1}",
-        rows,
-        value_input_option="USER_ENTERED",
-    )
-    logger.info("ОСАГО: записано %s единиц техники", len(rows))
+        by_plate = {}
+        for row_num, row in enumerate(rows, start=2):
+            padded = row + [""] * max(0, len(OSAGO_HEADERS) - len(row))
+            plate = padded[3].strip()
+            if plate:
+                by_plate[normalize_plate(plate)] = (row_num, padded)
+
+        append_rows = []
+        update_data = []
+
+        for name, plate in OSAGO_EQUIPMENT:
+            key = normalize_plate(plate)
+            preset_start, preset_end = OSAGO_PRESET_DATES.get(plate, ("", ""))
+
+            if key in by_plate:
+                row_num, old = by_plate[key]
+
+                if old[1] != name or old[3] != plate:
+                    update_data.append({
+                        "range": f"B{row_num}:D{row_num}",
+                        "values": [[name, old[2], plate]],
+                    })
+
+                start_value = old[4].strip()
+                end_value = old[5].strip()
+                new_start = start_value or preset_start
+                new_end = end_value or preset_end
+
+                if new_start != start_value or new_end != end_value:
+                    update_data.append({
+                        "range": f"E{row_num}:F{row_num}",
+                        "values": [[new_start, new_end]],
+                    })
+            else:
+                append_rows.append([
+                    "",
+                    name,
+                    "",
+                    plate,
+                    preset_start,
+                    preset_end,
+                    "",
+                    "",
+                    "",
+                    "",
+                ])
+
+        if append_rows:
+            first_row = max(len(rows) + 2, 2)
+            ws.update(
+                f"A{first_row}:J{first_row + len(append_rows) - 1}",
+                append_rows,
+                value_input_option="USER_ENTERED",
+            )
+
+        if update_data:
+            ws.spreadsheet.values_batch_update({
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {
+                        "range": f"'{ws.title}'!{item['range']}",
+                        "values": item["values"],
+                    }
+                    for item in update_data
+                ],
+            })
+
+        logger.info(
+            "ОСАГО: проверено %s единиц, добавлено %s",
+            len(OSAGO_EQUIPMENT),
+            len(append_rows),
+        )
+    except Exception:
+        logger.exception("Не удалось синхронизировать парк техники ОСАГО")
+        raise
 
 
 def migrate_diag_sheet(ws) -> None:
@@ -457,28 +514,85 @@ def migrate_diag_sheet(ws) -> None:
 
 
 def seed_diag_equipment(ws) -> None:
-    """Записывает парк диагностических карт напрямую в строки 2..N."""
-    rows = []
-    for name, plate in DIAG_EQUIPMENT:
-        issue_date, valid_to = DIAG_PRESET_DATES.get(plate, ("", ""))
-        rows.append([
-            "",
-            name,
-            "",
-            plate,
-            issue_date,
-            valid_to,
-            "",
-            "",
-            "",
-        ])
+    """Гарантирует наличие техники в диагностических картах, не стирая ручные данные."""
+    try:
+        values = ws.get_all_values()
+        rows = values[1:] if len(values) > 1 else []
 
-    ws.update(
-        f"A2:I{len(rows)+1}",
-        rows,
-        value_input_option="USER_ENTERED",
-    )
-    logger.info("Диагностические карты: записано %s единиц техники", len(rows))
+        by_plate = {}
+        for row_num, row in enumerate(rows, start=2):
+            padded = row + [""] * max(0, len(DIAG_HEADERS) - len(row))
+            plate = padded[3].strip()
+            if plate:
+                by_plate[normalize_plate(plate)] = (row_num, padded)
+
+        append_rows = []
+        update_data = []
+
+        for name, plate in DIAG_EQUIPMENT:
+            key = normalize_plate(plate)
+            preset_issue, preset_valid_to = DIAG_PRESET_DATES.get(plate, ("", ""))
+
+            if key in by_plate:
+                row_num, old = by_plate[key]
+
+                if old[1] != name or old[3] != plate:
+                    update_data.append({
+                        "range": f"B{row_num}:D{row_num}",
+                        "values": [[name, old[2], plate]],
+                    })
+
+                issue_value = old[4].strip()
+                valid_to_value = old[5].strip()
+                new_issue = issue_value or preset_issue
+                new_valid_to = valid_to_value or preset_valid_to
+
+                if new_issue != issue_value or new_valid_to != valid_to_value:
+                    update_data.append({
+                        "range": f"E{row_num}:F{row_num}",
+                        "values": [[new_issue, new_valid_to]],
+                    })
+            else:
+                append_rows.append([
+                    "",
+                    name,
+                    "",
+                    plate,
+                    preset_issue,
+                    preset_valid_to,
+                    "",
+                    "",
+                    "",
+                ])
+
+        if append_rows:
+            first_row = max(len(rows) + 2, 2)
+            ws.update(
+                f"A{first_row}:I{first_row + len(append_rows) - 1}",
+                append_rows,
+                value_input_option="USER_ENTERED",
+            )
+
+        if update_data:
+            ws.spreadsheet.values_batch_update({
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {
+                        "range": f"'{ws.title}'!{item['range']}",
+                        "values": item["values"],
+                    }
+                    for item in update_data
+                ],
+            })
+
+        logger.info(
+            "Диагностические карты: проверено %s единиц, добавлено %s",
+            len(DIAG_EQUIPMENT),
+            len(append_rows),
+        )
+    except Exception:
+        logger.exception("Не удалось синхронизировать диагностические карты")
+        raise
 
 
 def setup_document_sheet(ws, kind: str) -> None:
@@ -494,12 +608,14 @@ def setup_document_sheet(ws, kind: str) -> None:
     existing_days = ws.acell(f"{dcol}2", value_render_option="FORMULA").value or ""
     existing_status = ws.acell(f"{scol}2", value_render_option="FORMULA").value or ""
     formulas_ready = all(str(x).startswith("=") for x in (existing_a2, existing_days, existing_status))
-    # Формулы переписываем при запуске: это исправляет старые #ERROR! после смены локали/структуры.
 
     try:
         ws.set_basic_filter(f"A1:{last_col}500")
     except Exception:
         logger.exception("Не удалось установить фильтр для %s", ws.title)
+
+    if formulas_ready:
+        return
 
     rows = []
     for row in range(2, 502):
@@ -1617,7 +1733,7 @@ async def sync_documents_command(update: Update, context: ContextTypes.DEFAULT_T
         setup_dashboard(diag, "diag")
 
         await update.effective_message.reply_text(
-            f"✅ Документы синхронизированы.\n"
+            f"✅ Документы синхронизированы без перезаписи ручных данных.\n"
             f"ОСАГО: {len(OSAGO_EQUIPMENT)} машин.\n"
             f"Диагностические карты: {len(DIAG_EQUIPMENT)} машин.",
             reply_markup=menu(),
