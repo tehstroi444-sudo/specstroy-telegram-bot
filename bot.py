@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from typing import Any
 
@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2.4-crash-safe-documents"
+BOT_VERSION = "6.2.5-tomorrow-button"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1891,12 +1891,17 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d["step"] = "date_choice"
         await q.edit_message_text(
             "Укажите дату работы:",
-            reply_markup=buttons(["Сегодня", "Другая дата"], "date"),
+            reply_markup=buttons(["Сегодня", "Завтра", "Другая дата"], "date"),
         )
     elif action == "date":
-        if parts[1] == "0":
+        choice = parts[1]
+        if choice == "0":
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
-            await q.edit_message_text("Дата выбрана.")
+            await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
+            await ask_machine_driver(q.message, context)
+        elif choice == "1":
+            d["work_date"] = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+            await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
             await ask_machine_driver(q.message, context)
         else:
             d["step"] = "date_manual"
