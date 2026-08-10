@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2.5-tomorrow-button"
+BOT_VERSION = "6.2.6-manage-assigned-drivers"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1353,6 +1353,71 @@ def add_driver_for_plate(model: str, plate: str, driver: str, primary: bool = Fa
     return True, driver
 
 
+def remove_driver_for_plate(plate: str, driver: str) -> tuple[bool, str]:
+    """Удаляет привязку водителя к конкретной технике, не удаляя его из общего справочника."""
+    _, _, _, driver_map = initialize_sheets()
+    rows = driver_map.get_all_values()
+    target_plate = normalize(plate)
+    target_driver = normalize(driver)
+
+    for row_num, row in enumerate(rows[1:], start=2):
+        if len(row) >= 3 and normalize(row[1]) == target_plate and normalize(row[2]) == target_driver:
+            driver_map.delete_rows(row_num)
+            _DRIVER_CACHE.pop(plate, None)
+
+            # Если после удаления остались водители, а основного нет — первого делаем основным.
+            remaining = drivers_for_plate(plate)
+            if remaining and not any(primary for _, primary in remaining):
+                for rn, r in enumerate(driver_map.get_all_values()[1:], start=2):
+                    if len(r) >= 3 and normalize(r[1]) == target_plate:
+                        driver_map.update_cell(rn, 4, "Да")
+                        _DRIVER_CACHE.pop(plate, None)
+                        break
+
+            return True, driver
+
+    return False, "Привязка водителя к этой технике не найдена."
+
+
+async def show_driver_management(message, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает управление водителями, закреплёнными за выбранной техникой."""
+    d = context.user_data
+    assigned = drivers_for_plate(d["plate"])
+    rows = []
+
+    for index, (name, primary) in enumerate(assigned):
+        prefix = "✅ " if primary else ""
+        rows.append([
+            InlineKeyboardButton(
+                f"❌ Удалить: {prefix}{name}",
+                callback_data=f"driverdelete|{index}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "👷 Назначить из общего списка",
+            callback_data="driverassignexisting|0",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "➕ Добавить нового водителя",
+            callback_data="driveraddmachine|0",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ Назад к выбору водителя",
+            callback_data="driverback|0",
+        )
+    ])
+
+    text = f"Водители для {d['model']} — {d['plate']}:"
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+
 async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     assigned = drivers_for_plate(d["plate"])
@@ -1362,6 +1427,7 @@ async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
         rows.append([InlineKeyboardButton(label, callback_data=f"machdriver|{index}")])
     rows.append([InlineKeyboardButton("👷 Выбрать из общего списка", callback_data="driverother|0")])
     rows.append([InlineKeyboardButton("➕ Добавить водителя для этой техники", callback_data="driveraddmachine|0")])
+    rows.append([InlineKeyboardButton("⚙️ Управление водителями", callback_data="drivermanage|0")])
     await message.reply_text("Выберите водителя для этой техники:", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -1846,6 +1912,17 @@ async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: 
     d = context.user_data
     next_step = d.get("ref_next_step")
     if kind == "drivers":
+        if next_step == "assign_machine_driver":
+            ok, result = add_driver_for_plate(d["model"], d["plate"], value)
+            if ok:
+                await message.reply_text(
+                    f"✅ Водитель {result} закреплён за {d['model']} — {d['plate']}."
+                )
+            else:
+                await message.reply_text(result)
+            await show_driver_management(message, context)
+            return
+
         d["driver"] = value
         if d.get("category") == "dump":
             d["step"] = "object_count"
@@ -1922,6 +1999,30 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "driverother":
         await q.edit_message_text("Выберите водителя из общего списка.")
         await ask_ref(q.message, context, "drivers", "driver")
+    elif action == "drivermanage":
+        await q.edit_message_text("Управление закреплёнными водителями.")
+        await show_driver_management(q.message, context)
+    elif action == "driverdelete":
+        assigned = drivers_for_plate(d["plate"])
+        index = int(parts[1])
+        if index >= len(assigned):
+            await q.edit_message_text("Список водителей изменился. Откройте управление ещё раз.")
+            return
+        driver_name = assigned[index][0]
+        ok, result = remove_driver_for_plate(d["plate"], driver_name)
+        if ok:
+            await q.edit_message_text(
+                f"✅ Водитель {result} больше не закреплён за этой техникой."
+            )
+        else:
+            await q.edit_message_text(result)
+        await show_driver_management(q.message, context)
+    elif action == "driverassignexisting":
+        await q.edit_message_text("Выберите водителя из общего списка для закрепления за этой техникой.")
+        await ask_ref(q.message, context, "drivers", "assign_machine_driver")
+    elif action == "driverback":
+        await q.edit_message_text("Возвращаю к выбору водителя.")
+        await ask_machine_driver(q.message, context)
     elif action == "driveraddmachine":
         d["step"] = "add_machine_driver"
         await q.edit_message_text(
