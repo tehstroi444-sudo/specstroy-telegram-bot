@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2-reports-edit-prices-formulas"
+BOT_VERSION = "6.2.2-ruble-currency-format"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -82,8 +82,8 @@ SPECIAL_HEADERS = [
     "Модель",
     "Гос. номер",
     "Машинист / водитель",
-    "Объект",
     "Заказчик",
+    "Объект",
     "Начало",
     "Окончание",
     "Рабочее время, ч",
@@ -109,8 +109,8 @@ DUMP_HEADERS = [
 for i in range(1, 5):
     DUMP_HEADERS.extend(
         [
-            f"Объект {i}",
             f"Заказчик {i}",
+            f"Объект {i}",
             f"Ставка за рейс {i}, ₽",
             f"Рейсы {i}",
             f"Объём кузова {i}, м³",
@@ -605,6 +605,71 @@ def migrate_dump_remove_time_columns(ws) -> None:
         logger.info("Во вкладке Самосвалы удалены колонки Начало, Окончание и Рабочее время")
 
 
+def migrate_swap_customer_object_columns(ws, sheet_code: str) -> None:
+    """Меняет местами Заказчик и Объект в уже существующих таблицах.
+
+    Спецтехника:
+      F Заказчик, G Объект
+
+    Самосвалы:
+      F Заказчик 1, G Объект 1
+      L Заказчик 2, M Объект 2
+      R Заказчик 3, S Объект 3
+      X Заказчик 4, Y Объект 4
+    """
+    try:
+        headers = ws.row_values(1)
+        values = ws.get_all_values()
+        if not values:
+            return
+
+        if sheet_code == "special":
+            if len(headers) >= 7 and headers[5] == "Объект" and headers[6] == "Заказчик":
+                swapped = []
+                for row in values:
+                    padded = row + [""] * max(0, 7 - len(row))
+                    swapped.append([padded[6], padded[5]])
+                ws.update(
+                    f"F1:G{len(swapped)}",
+                    swapped,
+                    value_input_option="USER_ENTERED",
+                )
+                logger.info("Спецтехника: колонки Заказчик и Объект переставлены")
+            return
+
+        # Самосвалы: четыре пары. Работаем по каждой паре отдельно.
+        pairs = [
+            (6, "Объект 1", "Заказчик 1"),
+            (12, "Объект 2", "Заказчик 2"),
+            (18, "Объект 3", "Заказчик 3"),
+            (24, "Объект 4", "Заказчик 4"),
+        ]
+        for col_1based, object_header, customer_header in pairs:
+            idx = col_1based - 1
+            headers = ws.row_values(1)
+            if len(headers) <= idx + 1:
+                continue
+            if headers[idx] != object_header or headers[idx + 1] != customer_header:
+                continue
+
+            swapped = []
+            for row in values:
+                padded = row + [""] * max(0, idx + 2 - len(row))
+                swapped.append([padded[idx + 1], padded[idx]])
+
+            start = col_letter(col_1based)
+            end = col_letter(col_1based + 1)
+            ws.update(
+                f"{start}1:{end}{len(swapped)}",
+                swapped,
+                value_input_option="USER_ENTERED",
+            )
+
+        logger.info("Самосвалы: колонки Заказчик/Объект проверены и переставлены")
+    except Exception:
+        logger.exception("Не удалось поменять местами Заказчик и Объект во вкладке %s", ws.title)
+
+
 def migrate_remove_payment_status(ws) -> None:
     """Удаляет старую колонку «Статус оплаты», сохраняя остальные данные."""
     headers = ws.row_values(1)
@@ -626,8 +691,8 @@ def special_amount_formula(row: int) -> str:
 
 def dump_row_formulas(row: int) -> dict[int, str]:
     """Формулы Самосвалов. Ключ — номер колонки (1-based)."""
-    # Объект 1: H ставка, I рейсы, J кузов, K общий объём
-    # Объект 2: N/O/P/Q; объект 3: T/U/V/W; объект 4: Z/AA/AB/AC
+    # Заказчик/Объект занимают F:G, L:M, R:S, X:Y.
+    # Ставки и расчётные колонки остаются H:K, N:Q, T:W, Z:AC.
     formulas = {}
     blocks = [(8, 9, 10, 11), (14, 15, 16, 17), (20, 21, 22, 23), (26, 27, 28, 29)]
     for rate_col, trips_col, body_col, total_col in blocks:
@@ -652,6 +717,38 @@ def dump_row_formulas(row: int) -> dict[int, str]:
         f'IFERROR(W{row}*T{row};0)+IFERROR(AC{row}*Z{row};0))'
     )
     return formulas
+
+
+def apply_ruble_format(ws, header_name: str) -> None:
+    """Форматирует денежную колонку как российские рубли."""
+    try:
+        headers = ws.row_values(1)
+        if header_name not in headers:
+            return
+
+        col = headers.index(header_name) + 1
+        letter = col_letter(col)
+
+        ws.format(
+            f"{letter}2:{letter}{ws.row_count}",
+            {
+                "numberFormat": {
+                    "type": "NUMBER",
+                    "pattern": '#,##0.00 "₽"',
+                },
+                "horizontalAlignment": "RIGHT",
+            },
+        )
+        logger.info(
+            "Во вкладке %s колонка %s отформатирована в рублях",
+            ws.title,
+            header_name,
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось применить рублёвый формат во вкладке %s",
+            ws.title,
+        )
 
 
 def apply_report_formulas(special, dump) -> None:
@@ -715,7 +812,7 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
 
         # Заполняем служебную колонку для уже существующих отчетов.
         # После удаления колонок времени:
-        # G(7), M(13), S(19), Y(25) = Заказчик 1..4.
+        # F(6), L(12), R(18), X(24) = Заказчик 1..4.
         if len(rows) > 1:
             values = []
             changed = False
@@ -724,7 +821,7 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
                 customers = []
                 seen = set()
 
-                for idx in (6, 12, 18, 24):
+                for idx in (5, 11, 17, 23):
                     customer = padded[idx].strip() if idx < len(padded) else ""
                     key = normalize(customer)
                     if customer and key not in seen:
@@ -836,6 +933,7 @@ def initialize_sheets(force: bool = False):
 
     try:
         special_existing = sp.worksheet(SHEET_SPECIAL)
+        migrate_swap_customer_object_columns(special_existing, "special")
         migrate_remove_payment_status(special_existing)
     except gspread.WorksheetNotFound:
         pass
@@ -844,11 +942,14 @@ def initialize_sheets(force: bool = False):
     try:
         dump_existing = sp.worksheet(SHEET_DUMP)
         migrate_dump_remove_time_columns(dump_existing)
+        migrate_swap_customer_object_columns(dump_existing, "dump")
         migrate_remove_payment_status(dump_existing)
     except gspread.WorksheetNotFound:
         pass
     dump = ensure_sheet(sp, SHEET_DUMP, DUMP_HEADERS)
     apply_report_formulas(special, dump)
+    apply_ruble_format(special, "Сумма, ₽")
+    apply_ruble_format(dump, "Общая сумма, ₽")
 
     try:
         osago_existing = sp.worksheet(SHEET_OSAGO)
@@ -1343,12 +1444,12 @@ def build_customer_report(customer: str):
         plate = padded[3]
         driver = padded[4]
 
-        # Каждый объект занимает 6 колонок:
-        # Объект, Заказчик, Ставка, Рейсы, Объем кузова, Общий объем.
+        # Каждый блок занимает 6 колонок:
+        # Заказчик, Объект, Ставка, Рейсы, Объем кузова, Общий объем.
         for i in range(4):
             base = 5 + i * 6
-            obj = padded[base]
-            row_customer = padded[base + 1]
+            row_customer = padded[base]
+            obj = padded[base + 1]
             rate = padded[base + 2]
             trips = padded[base + 3]
             body_volume = padded[base + 4]
@@ -2027,8 +2128,8 @@ async def save_current_report(q, context):
             d["model"],
             d["plate"],
             d["driver"],
-            d["object"],
             d["customer"],
+            d["object"],
             d["start"],
             d["end"],
             d["hours"],
@@ -2059,8 +2160,8 @@ async def save_current_report(q, context):
                 obj = d["objects"][i]
                 row.extend(
                     [
-                        obj["object"],
                         obj["customer"],
+                        obj["object"],
                         obj["rate_trip"],
                         obj["trips"],
                         obj["volume"],
@@ -2095,8 +2196,8 @@ async def save_current_report(q, context):
 SPECIAL_EDIT_FIELDS = [
     ("Дата работы", 1),
     ("Водитель", 5),
-    ("Объект", 6),
-    ("Заказчик", 7),
+    ("Заказчик", 6),
+    ("Объект", 7),
     ("Начало", 8),
     ("Окончание", 9),
     ("Вид ставки", 11),
@@ -2114,8 +2215,8 @@ for _i in range(4):
     _base = 6 + _i * 6
     DUMP_EDIT_FIELDS.extend(
         [
-            (f"Объект {_i+1}", _base),
-            (f"Заказчик {_i+1}", _base + 1),
+            (f"Заказчик {_i+1}", _base),
+            (f"Объект {_i+1}", _base + 1),
             (f"Ставка {_i+1}", _base + 2),
             (f"Рейсы {_i+1}", _base + 3),
             (f"Объём кузова {_i+1}", _base + 4),
@@ -2136,7 +2237,7 @@ def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
         ws.update_cell(row_num, 15, special_amount_formula(row_num))
 
         # Если изменена цена и объект известен — сохраняем новую цену объекта.
-        obj = row[5].strip()
+        obj = row[6].strip()
         rate_type = row[10].strip()
         if obj:
             price_text = row[12] if rate_type == "За рейс" else row[11]
@@ -2155,7 +2256,7 @@ def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
         row += [""] * max(0, len(DUMP_HEADERS) - len(row))
         customers = []
         seen = set()
-        for idx in (6, 12, 18, 24):  # G,M,S,Y
+        for idx in (5, 11, 17, 23):  # G,M,S,Y
             customer = row[idx].strip() if idx < len(row) else ""
             key = normalize(customer)
             if customer and key not in seen:
