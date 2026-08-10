@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
+import time
 from typing import Any
 
 import gspread
@@ -24,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2.3-documents-persistence-fixed"
+BOT_VERSION = "6.2.4-crash-safe-documents"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -456,7 +457,7 @@ def seed_osago_equipment(ws) -> None:
         )
     except Exception:
         logger.exception("Не удалось синхронизировать парк техники ОСАГО")
-        raise
+        return
 
 
 def migrate_diag_sheet(ws) -> None:
@@ -592,7 +593,7 @@ def seed_diag_equipment(ws) -> None:
         )
     except Exception:
         logger.exception("Не удалось синхронизировать диагностические карты")
-        raise
+        return
 
 
 def setup_document_sheet(ws, kind: str) -> None:
@@ -1037,7 +1038,7 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
         logger.exception("Не удалось настроить индивидуальные фильтры заказчиков")
 
 
-def initialize_sheets(force: bool = False):
+def _initialize_sheets_once(force: bool = False):
     global _SHEET_CACHE, _DIRECTORY_SHEETS
     if _SHEET_CACHE is not None and not force:
         return _SHEET_CACHE
@@ -1145,6 +1146,33 @@ def initialize_sheets(force: bool = False):
 
     _SHEET_CACHE = (special, dump, None, driver_map)
     return _SHEET_CACHE
+
+
+def initialize_sheets(force: bool = False):
+    """Инициализация Google Sheets с повторами при временной ошибке API."""
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            return _initialize_sheets_once(force=force)
+        except Exception as exc:
+            last_exc = exc
+            text = str(exc)
+            retryable = (
+                "429" in text
+                or "Quota exceeded" in text
+                or "RESOURCE_EXHAUSTED" in text
+                or "503" in text
+                or "500" in text
+            )
+            logger.exception(
+                "Ошибка Google Sheets при инициализации, попытка %s/3",
+                attempt,
+            )
+            if not retryable or attempt == 3:
+                raise
+            time.sleep(20 * attempt)
+    raise last_exc
+
 
 def first_empty_row(ws, column: int = 1) -> int:
     values = ws.col_values(column)
@@ -1744,6 +1772,13 @@ async def sync_documents_command(update: Update, context: ContextTypes.DEFAULT_T
             f"❌ Ошибка: {type(exc).__name__}: {exc}",
             reply_markup=menu(),
         )
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"✅ Бот работает.\nВерсия: {BOT_VERSION}",
+        reply_markup=menu(),
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2439,6 +2474,7 @@ def build():
     app.add_handler(CommandHandler("new", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("version", version))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("syncdocs", sync_documents_command))
     app.add_handler(MessageHandler(filters.Regex(r"^🚜 Спецтехника$"), begin_special))
     app.add_handler(MessageHandler(filters.Regex(r"^🚛 Самосвалы$"), begin_dump))
@@ -2452,5 +2488,11 @@ def build():
 
 if __name__ == "__main__":
     logger.info("Запуск бота %s", BOT_VERSION)
-    initialize_sheets()
+    try:
+        initialize_sheets()
+    except Exception:
+        logger.exception(
+            "Google Sheets временно недоступен при запуске. "
+            "Telegram-бот всё равно будет запущен."
+        )
     build().run_polling(drop_pending_updates=False)
