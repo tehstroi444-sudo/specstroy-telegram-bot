@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.2.6-manage-assigned-drivers"
+BOT_VERSION = "6.3-customer-prices-special-styled"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -209,7 +209,7 @@ DIAG_PRESET_DATES = {
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
 DIRECTORY_SHEETS = {"drivers": SHEET_DRIVERS, "objects": SHEET_OBJECTS, "customers": SHEET_CUSTOMERS}
-DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект", "Цена, ₽"], "customers": ["Заказчик"]}
+DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект"], "customers": ["Заказчик", "Цена, ₽"]}
 
 CUSTOMER_REPORT_HEADERS = [
     "Дата",
@@ -787,6 +787,32 @@ def migrate_swap_customer_object_columns(ws, sheet_code: str) -> None:
         logger.exception("Не удалось поменять местами Заказчик и Объект во вкладке %s", ws.title)
 
 
+def migrate_price_directory_to_customers(objects_ws, customers_ws) -> None:
+    """Переносит структуру цены с «Объекты» на «Заказчики».
+
+    Старые объектные цены не переносятся автоматически, потому что нельзя
+    достоверно определить, какому заказчику они должны принадлежать.
+    """
+    try:
+        object_headers = objects_ws.row_values(1)
+        if len(object_headers) >= 2 and object_headers[1] == "Цена, ₽":
+            objects_ws.delete_columns(2)
+            logger.info("Из вкладки Объекты удалена старая колонка Цена, ₽")
+
+        if customers_ws.col_count < 2:
+            customers_ws.add_cols(2 - customers_ws.col_count)
+
+        customer_headers = customers_ws.row_values(1)
+        if len(customer_headers) < 2 or customer_headers[1] != "Цена, ₽":
+            customers_ws.update(
+                "A1:B1",
+                [["Заказчик", "Цена, ₽"]],
+                value_input_option="USER_ENTERED",
+            )
+    except Exception:
+        logger.exception("Не удалось перевести хранение цены с объектов на заказчиков")
+
+
 def migrate_remove_payment_status(ws) -> None:
     """Удаляет старую колонку «Статус оплаты», сохраняя остальные данные."""
     headers = ws.row_values(1)
@@ -834,6 +860,116 @@ def dump_row_formulas(row: int) -> dict[int, str]:
         f'IFERROR(W{row}*T{row};0)+IFERROR(AC{row}*Z{row};0))'
     )
     return formulas
+
+
+def style_special_sheet(ws) -> None:
+    """Оформляет вкладку Спецтехника и включает фильтр по каждой колонке."""
+    try:
+        last_col = col_letter(len(SPECIAL_HEADERS))
+        last_row = max(ws.row_count, 1000)
+
+        ws.freeze(rows=1)
+        ws.set_basic_filter(f"A1:{last_col}{last_row}")
+
+        # Общий аккуратный вид таблицы.
+        ws.format(
+            f"A1:{last_col}{last_row}",
+            {
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+                "borders": {
+                    "top": {"style": "SOLID", "color": {"red": 0.86, "green": 0.88, "blue": 0.91}},
+                    "bottom": {"style": "SOLID", "color": {"red": 0.86, "green": 0.88, "blue": 0.91}},
+                    "left": {"style": "SOLID", "color": {"red": 0.86, "green": 0.88, "blue": 0.91}},
+                    "right": {"style": "SOLID", "color": {"red": 0.86, "green": 0.88, "blue": 0.91}},
+                },
+            },
+        )
+
+        # Шапка.
+        ws.format(
+            f"A1:{last_col}1",
+            {
+                "backgroundColor": {"red": 0.04, "green": 0.24, "blue": 0.43},
+                "textFormat": {
+                    "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                    "bold": True,
+                    "fontSize": 10,
+                },
+                "horizontalAlignment": "CENTER",
+                "verticalAlignment": "MIDDLE",
+                "wrapStrategy": "WRAP",
+            },
+        )
+
+        # Поля с числами и временем.
+        ws.format("A2:A", {"horizontalAlignment": "CENTER"})
+        ws.format("D2:D", {"horizontalAlignment": "CENTER"})
+        ws.format("H2:J", {"horizontalAlignment": "CENTER"})
+        ws.format("K2:O", {"horizontalAlignment": "RIGHT"})
+
+        # Денежные столбцы.
+        for col in ("L", "M", "O"):
+            ws.format(
+                f"{col}2:{col}",
+                {
+                    "numberFormat": {
+                        "type": "NUMBER",
+                        "pattern": '#,##0.00 "₽"',
+                    }
+                },
+            )
+
+        # Удобные ширины столбцов.
+        widths = {
+            0: 105,  # дата
+            1: 155,  # техника
+            2: 115,  # модель
+            3: 120,  # госномер
+            4: 160,  # водитель
+            5: 180,  # заказчик
+            6: 190,  # объект
+            7: 80, 8: 80, 9: 105,
+            10: 110, 11: 105, 12: 125, 13: 75, 14: 120,
+            15: 180, 16: 145, 17: 140, 18: 135, 19: 110,
+        }
+        requests = []
+        for index, width in widths.items():
+            requests.append(
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": index,
+                            "endIndex": index + 1,
+                        },
+                        "properties": {"pixelSize": width},
+                        "fields": "pixelSize",
+                    }
+                }
+            )
+
+        # Высота шапки.
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": 0,
+                        "endIndex": 1,
+                    },
+                    "properties": {"pixelSize": 44},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+        ws.spreadsheet.batch_update({"requests": requests})
+        logger.info("Вкладка Спецтехника оформлена; фильтр включён для всех колонок")
+    except Exception:
+        logger.exception("Не удалось оформить вкладку Спецтехника")
 
 
 def apply_ruble_format(ws, header_name: str) -> None:
@@ -1086,8 +1222,23 @@ def _initialize_sheets_once(force: bool = False):
     diag = ensure_sheet(sp, SHEET_DIAG, DIAG_HEADERS, 600)
     seed_diag_equipment(diag)
     drivers_ws = ensure_sheet(sp, SHEET_DRIVERS, DIRECTORY_HEADERS["drivers"], 500)
+
+    # Сначала открываем справочники, затем корректируем старую структуру цен.
+    try:
+        objects_existing = sp.worksheet(SHEET_OBJECTS)
+    except gspread.WorksheetNotFound:
+        objects_existing = None
+    try:
+        customers_existing = sp.worksheet(SHEET_CUSTOMERS)
+    except gspread.WorksheetNotFound:
+        customers_existing = None
+
     objects_ws = ensure_sheet(sp, SHEET_OBJECTS, DIRECTORY_HEADERS["objects"], 500)
     customers_ws = ensure_sheet(sp, SHEET_CUSTOMERS, DIRECTORY_HEADERS["customers"], 500)
+    migrate_price_directory_to_customers(objects_ws, customers_ws)
+    apply_ruble_format(customers_ws, "Цена, ₽")
+
+    style_special_sheet(special)
     setup_dump_customer_filter(dump, customers_ws)
     equipment_ws = ensure_sheet(sp, SHEET_EQUIPMENT, EQUIPMENT_HEADERS, 200)
     driver_map = ensure_sheet(sp, SHEET_DRIVER_MAP, DRIVER_MAP_HEADERS, 300)
@@ -1240,12 +1391,13 @@ def add_ref(kind: str, value: str) -> tuple[bool, str]:
     return True, value
 
 
-def get_object_price(object_name: str) -> float | None:
-    """Возвращает сохранённую цену объекта из вкладки «Объекты»."""
+def get_customer_price(customer_name: str) -> float | None:
+    """Возвращает сохранённую цену заказчика из вкладки «Заказчики»."""
     initialize_sheets()
-    ws = _DIRECTORY_SHEETS["objects"]
+    ws = _DIRECTORY_SHEETS["customers"]
     rows = ws.get_all_values()
-    target = normalize(object_name)
+    target = normalize(customer_name)
+
     for row in rows[1:]:
         if row and normalize(row[0]) == target:
             if len(row) < 2 or not str(row[1]).strip():
@@ -1257,29 +1409,32 @@ def get_object_price(object_name: str) -> float | None:
     return None
 
 
-def set_object_price(object_name: str, price: float) -> None:
-    """Сохраняет/обновляет цену объекта."""
+def set_customer_price(customer_name: str, price: float) -> None:
+    """Сохраняет или обновляет цену, закреплённую за заказчиком."""
     initialize_sheets()
-    ws = _DIRECTORY_SHEETS["objects"]
+    ws = _DIRECTORY_SHEETS["customers"]
     rows = ws.get_all_values()
-    target = normalize(object_name)
+    target = normalize(customer_name)
+
     for row_num, row in enumerate(rows[1:], start=2):
         if row and normalize(row[0]) == target:
             ws.update_cell(row_num, 2, price)
+            _REF_CACHE["customers"] = None
             return
+
     row_num = first_empty_row(ws, 1)
     ws.update(
         f"A{row_num}:B{row_num}",
-        [[object_name, price]],
+        [[customer_name, price]],
         value_input_option="USER_ENTERED",
     )
-    _REF_CACHE["objects"] = None
+    _REF_CACHE["customers"] = None
 
 
 async def prompt_special_price(message, context: ContextTypes.DEFAULT_TYPE):
-    """Предлагает сохранённую цену объекта либо ввод новой."""
+    """Предлагает сохранённую цену заказчика либо ввод новой."""
     d = context.user_data
-    saved = get_object_price(d.get("object", ""))
+    saved = get_customer_price(d.get("customer", ""))
     if d.get("rate_type") == "-":
         d["rate"] = "-"
         d["rate_trip"] = "-"
@@ -1291,11 +1446,11 @@ async def prompt_special_price(message, context: ContextTypes.DEFAULT_TYPE):
     d["saved_object_price"] = saved
     if saved is not None:
         await message.reply_text(
-            f"Для объекта «{d['object']}» сохранена цена: {saved:g} ₽.",
+            f"Для заказчика «{d['customer']}» сохранена цена: {saved:g} ₽.",
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton(f"✅ Использовать {saved:g} ₽", callback_data="objprice|use")],
-                    [InlineKeyboardButton("✏️ Изменить цену", callback_data="objprice|change")],
+                    [InlineKeyboardButton(f"✅ Использовать {saved:g} ₽", callback_data="custprice|use")],
+                    [InlineKeyboardButton("✏️ Изменить цену", callback_data="custprice|change")],
                 ]
             ),
         )
@@ -2037,7 +2192,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["trips"] = "-"
         await q.edit_message_text(f"Вид ставки: {d['rate_type']}")
         await prompt_special_price(q.message, context)
-    elif action == "objprice":
+    elif action == "custprice":
         choice = parts[1]
         if choice == "use":
             price = d.get("saved_object_price")
@@ -2213,13 +2368,13 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "rate":
             d["rate"] = number_or_dash(value)
             if d["rate"] != "-":
-                set_object_price(d["object"], float(d["rate"]))
+                set_customer_price(d["customer"], float(d["rate"]))
             d["step"] = "note"
             await update.message.reply_text("Введите примечание или «-»:")
         elif step == "rate_trip":
             d["rate_trip"] = number_or_dash(value)
             if d["rate_trip"] != "-":
-                set_object_price(d["object"], float(d["rate_trip"]))
+                set_customer_price(d["customer"], float(d["rate_trip"]))
             d["step"] = "trips"
             await update.message.reply_text("Введите количество рейсов или «-»:")
         elif step == "trips":
@@ -2493,14 +2648,17 @@ def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
             ws.update_cell(row_num, 10, hours)
         ws.update_cell(row_num, 15, special_amount_formula(row_num))
 
-        # Если изменена цена и объект известен — сохраняем новую цену объекта.
-        obj = row[6].strip()
+        # Если изменена цена — сохраняем её за заказчиком.
+        customer = row[5].strip()
         rate_type = row[10].strip()
-        if obj:
+        if customer:
             price_text = row[12] if rate_type == "За рейс" else row[11]
             if str(price_text).strip() not in ("", "-"):
                 try:
-                    set_object_price(obj, float(str(price_text).replace(" ", "").replace(",", ".")))
+                    set_customer_price(
+                        customer,
+                        float(str(price_text).replace(" ", "").replace(",", "."))
+                    )
                 except ValueError:
                     pass
     else:
