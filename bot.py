@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.1-filters-fixed"
+BOT_VERSION = "6.5.2-classic-filters-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -873,6 +873,103 @@ def dump_row_formulas(row: int) -> dict[int, str]:
     return formulas
 
 
+def remove_google_sheets_tables_keep_data(ws) -> None:
+    """Убирает объект Google Sheets «Таблица», сохраняя данные и формулы.
+
+    Меню вида «Изменить тип столбца / Столбец для фильтра» относится к новой
+    сущности Google Sheets Table. Оно не является классическим BasicFilter.
+    Чтобы получить обычное меню фильтра по значениям, таблица преобразуется
+    обратно в обычный диапазон, после чего ставится BasicFilter.
+    """
+    try:
+        sp = ws.spreadsheet
+
+        # Получаем метаданные листов, включая Tables.
+        metadata = None
+        params = {
+            "fields": "sheets(properties(sheetId,title),tables(tableId,name,range))"
+        }
+
+        client = getattr(sp, "client", None)
+        http_client = getattr(client, "http_client", None)
+
+        if http_client is not None and hasattr(http_client, "fetch_sheet_metadata"):
+            metadata = http_client.fetch_sheet_metadata(sp.id, params=params)
+        elif client is not None and hasattr(client, "fetch_sheet_metadata"):
+            metadata = client.fetch_sheet_metadata(sp.id, params=params)
+        elif hasattr(sp, "fetch_sheet_metadata"):
+            metadata = sp.fetch_sheet_metadata(params=params)
+
+        if not metadata:
+            logger.info("Метаданные Tables для %s недоступны; пропускаем удаление Table", ws.title)
+            return
+
+        sheet_meta = None
+        for sheet in metadata.get("sheets", []):
+            props = sheet.get("properties", {})
+            if props.get("sheetId") == ws.id:
+                sheet_meta = sheet
+                break
+
+        tables = (sheet_meta or {}).get("tables", [])
+        if not tables:
+            logger.info("На листе %s объектов Google Sheets Table нет", ws.title)
+            return
+
+        # Сохраняем значения именно как формулы, чтобы не потерять расчёты.
+        last_col = col_letter(max(1, ws.col_count))
+        last_row = max(1, ws.row_count)
+        save_range = f"A1:{last_col}{last_row}"
+
+        try:
+            snapshot = ws.get(
+                save_range,
+                value_render_option="FORMULA",
+            )
+        except Exception:
+            # Совместимость со старыми версиями gspread.
+            snapshot = ws.get_all_values()
+
+        delete_requests = [
+            {"deleteTable": {"tableId": table["tableId"]}}
+            for table in tables
+            if table.get("tableId")
+        ]
+
+        if not delete_requests:
+            return
+
+        # DeleteTable удаляет также содержимое таблицы, поэтому после запроса
+        # сразу возвращаем сохранённые значения/формулы.
+        sp.batch_update({"requests": delete_requests})
+
+        if snapshot:
+            row_count = len(snapshot)
+            col_count = max((len(r) for r in snapshot), default=1)
+            normalized = [
+                list(r) + [""] * (col_count - len(r))
+                for r in snapshot
+            ]
+            restore_range = f"A1:{col_letter(col_count)}{row_count}"
+            ws.update(
+                restore_range,
+                normalized,
+                value_input_option="USER_ENTERED",
+            )
+
+        logger.info(
+            "На листе %s удалено Google Sheets Tables: %s; данные восстановлены",
+            ws.title,
+            len(delete_requests),
+        )
+
+    except Exception:
+        logger.exception(
+            "Не удалось преобразовать Google Sheets Table в обычный диапазон на %s",
+            ws.title,
+        )
+
+
 def ensure_standard_value_filter(ws, headers: list[str]) -> None:
     """Гарантированно включает обычный фильтр Google Sheets на всю таблицу.
 
@@ -880,6 +977,10 @@ def ensure_standard_value_filter(ws, headers: list[str]) -> None:
     сортировка, фильтр по условию, фильтр по значению, поиск и галочки.
     """
     try:
+        # Если лист оформлен как новая Google Sheets «Таблица», сначала
+        # преобразуем её обратно в обычный диапазон.
+        remove_google_sheets_tables_keep_data(ws)
+
         # Работаем строго в пределах реального размера листа.
         last_col = col_letter(len(headers))
         last_row = max(2, ws.row_count)
@@ -2100,7 +2201,7 @@ async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ensure_standard_value_filter(special, SPECIAL_HEADERS)
         ensure_standard_value_filter(dump, DUMP_HEADERS)
         await update.effective_message.reply_text(
-            "✅ Выпадающие фильтры восстановлены во вкладках "
+            "✅ Таблицы преобразованы в обычные диапазоны, классические выпадающие фильтры восстановлены во вкладках "
             "«Спецтехника» и «Самосвалы».",
             reply_markup=menu(),
         )
