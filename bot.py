@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5-customer-prices-freeze-columns"
+BOT_VERSION = "6.5.1-filters-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -873,6 +873,45 @@ def dump_row_formulas(row: int) -> dict[int, str]:
     return formulas
 
 
+def ensure_standard_value_filter(ws, headers: list[str]) -> None:
+    """Гарантированно включает обычный фильтр Google Sheets на всю таблицу.
+
+    Это именно фильтр с выпадающим меню в заголовках:
+    сортировка, фильтр по условию, фильтр по значению, поиск и галочки.
+    """
+    try:
+        # Работаем строго в пределах реального размера листа.
+        last_col = col_letter(len(headers))
+        last_row = max(2, ws.row_count)
+
+        # Сначала удаляем старый basic filter отдельным запросом.
+        try:
+            ws.spreadsheet.batch_update(
+                {"requests": [{"clearBasicFilter": {"sheetId": ws.id}}]}
+            )
+        except Exception:
+            # Если фильтра не было, это не должно мешать дальнейшей установке.
+            logger.info("На листе %s старого basic filter не было", ws.title)
+
+        # gspread сам формирует корректный BasicFilter.
+        ws.set_basic_filter(f"A1:{last_col}{last_row}")
+
+        # Закрепляем строку заголовков.
+        ws.freeze(rows=1, cols=5)
+
+        logger.info(
+            "Стандартный выпадающий фильтр включён на %s: A1:%s%s",
+            ws.title,
+            last_col,
+            last_row,
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось включить стандартный выпадающий фильтр на %s",
+            ws.title,
+        )
+
+
 def style_special_sheet(ws) -> None:
     """Оформляет вкладку Спецтехника и включает фильтр по каждой колонке."""
     try:
@@ -881,31 +920,7 @@ def style_special_sheet(ws) -> None:
 
         ws.freeze(rows=1, cols=5)
 
-        # Стандартный фильтр Google Sheets:
-        # сортировка, фильтр по условию и фильтр по значениям с галочками и поиском.
-        try:
-            ws.spreadsheet.batch_update(
-                {
-                    "requests": [
-                        {"clearBasicFilter": {"sheetId": ws.id}},
-                        {
-                            "setBasicFilter": {
-                                "filter": {
-                                    "range": {
-                                        "sheetId": ws.id,
-                                        "startRowIndex": 0,
-                                        "endRowIndex": last_row,
-                                        "startColumnIndex": 0,
-                                        "endColumnIndex": len(SPECIAL_HEADERS),
-                                    }
-                                }
-                            }
-                        },
-                    ]
-                }
-            )
-        except Exception:
-            logger.exception("Не удалось создать стандартный фильтр Спецтехники")
+        # Стандартный фильтр будет установлен отдельно после полного оформления листа.
 
         # Общий аккуратный вид таблицы.
         ws.format(
@@ -1133,23 +1148,10 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
                     value_input_option="USER_ENTERED",
                 )
 
-        # Обычный фильтр на всю таблицу тоже оставляем.
-        requests = [
-            {"clearBasicFilter": {"sheetId": ws.id}},
-            {
-                "setBasicFilter": {
-                    "filter": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "startRowIndex": 0,
-                            "endRowIndex": ws.row_count,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": len(DUMP_HEADERS),
-                        }
-                    }
-                }
-            },
-        ]
+        # Filter Views создаём отдельно.
+        # Обычный выпадающий basic filter ставится после этой функции отдельным запросом,
+        # чтобы ошибка одного Filter View не могла убрать фильтр из заголовков.
+        requests = []
 
         # Получаем сохраненных заказчиков.
         customers = []
@@ -1203,8 +1205,9 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
                 }
             )
 
-        # Один batch-запрос вместо множества отдельных обращений к API.
-        ws.spreadsheet.batch_update({"requests": requests})
+        # Filter Views отправляем отдельно от основного фильтра.
+        if requests:
+            ws.spreadsheet.batch_update({"requests": requests})
         logger.info(
             "Созданы индивидуальные фильтры заказчиков: %s",
             len(customers),
@@ -1280,6 +1283,11 @@ def _initialize_sheets_once(force: bool = False):
 
     style_special_sheet(special)
     setup_dump_customer_filter(dump, customers_ws)
+
+    # ВАЖНО: ставим обычные фильтры последними, после оформления и Filter Views.
+    # Тогда в каждой колонке заголовка появляется выпадающее меню Google Sheets.
+    ensure_standard_value_filter(special, SPECIAL_HEADERS)
+    ensure_standard_value_filter(dump, DUMP_HEADERS)
     equipment_ws = ensure_sheet(sp, SHEET_EQUIPMENT, EQUIPMENT_HEADERS, 200)
     driver_map = ensure_sheet(sp, SHEET_DRIVER_MAP, DRIVER_MAP_HEADERS, 300)
     _DIRECTORY_SHEETS = {"drivers": drivers_ws, "objects": objects_ws, "customers": customers_ws}
@@ -2085,6 +2093,25 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно восстанавливает выпадающие фильтры Спецтехники и Самосвалов."""
+    try:
+        special, dump, _, _ = initialize_sheets()
+        ensure_standard_value_filter(special, SPECIAL_HEADERS)
+        ensure_standard_value_filter(dump, DUMP_HEADERS)
+        await update.effective_message.reply_text(
+            "✅ Выпадающие фильтры восстановлены во вкладках "
+            "«Спецтехника» и «Самосвалы».",
+            reply_markup=menu(),
+        )
+    except Exception as exc:
+        logger.exception("Ошибка восстановления фильтров")
+        await update.effective_message.reply_text(
+            f"❌ Не удалось восстановить фильтры: {type(exc).__name__}: {exc}",
+            reply_markup=menu(),
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     initialize_sheets()
@@ -2859,6 +2886,7 @@ def build():
     app.add_handler(CommandHandler("new", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("version", version))
+    app.add_handler(CommandHandler("filters", filters_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("syncdocs", sync_documents_command))
     app.add_handler(MessageHandler(filters.Regex(r"^🚜 Спецтехника$"), begin_special))
