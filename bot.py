@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.4-dump-object-last-price"
+BOT_VERSION = "6.5-customer-prices-freeze-columns"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -209,7 +209,7 @@ DIAG_PRESET_DATES = {
 REF_HEADERS = ["Водители", "Объекты", "Заказчики"]
 REF_TITLES = {"drivers": "Водители", "objects": "Объекты", "customers": "Заказчики"}
 DIRECTORY_SHEETS = {"drivers": SHEET_DRIVERS, "objects": SHEET_OBJECTS, "customers": SHEET_CUSTOMERS}
-DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект", "Последняя цена самосвала, ₽"], "customers": ["Заказчик", "Цена, ₽"]}
+DIRECTORY_HEADERS = {"drivers": ["Водитель"], "objects": ["Объект"], "customers": ["Заказчик", "Последняя цена спецтехники, ₽", "Последняя цена самосвала, ₽"]}
 
 CUSTOMER_REPORT_HEADERS = [
     "Дата",
@@ -788,33 +788,40 @@ def migrate_swap_customer_object_columns(ws, sheet_code: str) -> None:
 
 
 def migrate_price_directory_to_customers(objects_ws, customers_ws) -> None:
-    """Поддерживает две независимые цены.
+    """Переводит хранение последних цен полностью на заказчика.
 
-    Спецтехника: цена закреплена за заказчиком.
-    Самосвалы: последняя цена закреплена за объектом.
+    B — последняя цена Спецтехники.
+    C — последняя цена Самосвалов.
+
+    Старая цена заказчика из колонки B сохраняется как цена Спецтехники.
+    Старая объектная цена Самосвалов удаляется, т.к. теперь цена относится к заказчику.
     """
     try:
-        if objects_ws.col_count < 2:
-            objects_ws.add_cols(2 - objects_ws.col_count)
+        # Объекты больше не содержат цену.
         object_headers = objects_ws.row_values(1)
-        if len(object_headers) < 2 or object_headers[1] != "Последняя цена самосвала, ₽":
-            objects_ws.update(
-                "A1:B1",
-                [["Объект", "Последняя цена самосвала, ₽"]],
-                value_input_option="USER_ENTERED",
-            )
+        if len(object_headers) >= 2:
+            objects_ws.delete_columns(2)
+        objects_ws.update(
+            "A1",
+            [["Объект"]],
+            value_input_option="USER_ENTERED",
+        )
 
-        if customers_ws.col_count < 2:
-            customers_ws.add_cols(2 - customers_ws.col_count)
-        customer_headers = customers_ws.row_values(1)
-        if len(customer_headers) < 2 or customer_headers[1] != "Цена, ₽":
-            customers_ws.update(
-                "A1:B1",
-                [["Заказчик", "Цена, ₽"]],
-                value_input_option="USER_ENTERED",
-            )
+        # Заказчики: сохраняем существующую колонку B и добавляем C.
+        if customers_ws.col_count < 3:
+            customers_ws.add_cols(3 - customers_ws.col_count)
+
+        customers_ws.update(
+            "A1:C1",
+            [[
+                "Заказчик",
+                "Последняя цена спецтехники, ₽",
+                "Последняя цена самосвала, ₽",
+            ]],
+            value_input_option="USER_ENTERED",
+        )
     except Exception:
-        logger.exception("Не удалось настроить справочники цен")
+        logger.exception("Не удалось перевести хранение цен полностью на заказчиков")
 
 
 def migrate_remove_payment_status(ws) -> None:
@@ -872,7 +879,7 @@ def style_special_sheet(ws) -> None:
         last_col = col_letter(len(SPECIAL_HEADERS))
         last_row = max(ws.row_count, 1000)
 
-        ws.freeze(rows=1)
+        ws.freeze(rows=1, cols=5)
 
         # Стандартный фильтр Google Sheets:
         # сортировка, фильтр по условию и фильтр по значениям с галочками и поиском.
@@ -1090,6 +1097,9 @@ def setup_dump_customer_filter(ws, customers_ws=None) -> None:
     helper_letter = col_letter(helper_col)
 
     try:
+        # Чтобы Гос. номер (D) и Машинист/водитель (E) оставались видимы,
+        # Google Sheets требует закрепить непрерывный диапазон слева A:E.
+        ws.freeze(rows=1, cols=5)
         rows = ws.get_all_values()
 
         # Заполняем служебную колонку для уже существующих отчетов.
@@ -1265,8 +1275,8 @@ def _initialize_sheets_once(force: bool = False):
     objects_ws = ensure_sheet(sp, SHEET_OBJECTS, DIRECTORY_HEADERS["objects"], 500)
     customers_ws = ensure_sheet(sp, SHEET_CUSTOMERS, DIRECTORY_HEADERS["customers"], 500)
     migrate_price_directory_to_customers(objects_ws, customers_ws)
-    apply_ruble_format(customers_ws, "Цена, ₽")
-    apply_ruble_format(objects_ws, "Последняя цена самосвала, ₽")
+    apply_ruble_format(customers_ws, "Последняя цена спецтехники, ₽")
+    apply_ruble_format(customers_ws, "Последняя цена самосвала, ₽")
 
     style_special_sheet(special)
     setup_dump_customer_filter(dump, customers_ws)
@@ -1421,119 +1431,87 @@ def add_ref(kind: str, value: str) -> tuple[bool, str]:
     return True, value
 
 
-def get_customer_price(customer_name: str) -> float | None:
-    """Возвращает сохранённую цену заказчика из вкладки «Заказчики»."""
+def get_customer_price(customer_name: str, category: str = "special") -> float | None:
+    """Возвращает последнюю цену заказчика для нужной категории."""
     initialize_sheets()
     ws = _DIRECTORY_SHEETS["customers"]
     rows = ws.get_all_values()
     target = normalize(customer_name)
+    price_col = 1 if category == "special" else 2  # Python index: B или C
 
     for row in rows[1:]:
         if row and normalize(row[0]) == target:
-            if len(row) < 2 or not str(row[1]).strip():
+            if len(row) <= price_col or not str(row[price_col]).strip():
                 return None
             try:
-                return float(str(row[1]).replace(" ", "").replace(",", "."))
+                return float(str(row[price_col]).replace(" ", "").replace(",", "."))
             except ValueError:
                 return None
     return None
 
 
-def set_customer_price(customer_name: str, price: float) -> None:
-    """Сохраняет или обновляет цену, закреплённую за заказчиком."""
+def set_customer_price(customer_name: str, price: float, category: str = "special") -> None:
+    """Сохраняет последнюю цену заказчика для Спецтехники или Самосвалов."""
     initialize_sheets()
     ws = _DIRECTORY_SHEETS["customers"]
     rows = ws.get_all_values()
     target = normalize(customer_name)
+    sheet_col = 2 if category == "special" else 3
 
     for row_num, row in enumerate(rows[1:], start=2):
         if row and normalize(row[0]) == target:
-            ws.update_cell(row_num, 2, price)
+            ws.update_cell(row_num, sheet_col, price)
             _REF_CACHE["customers"] = None
             return
 
     row_num = first_empty_row(ws, 1)
+    values = [customer_name, "", ""]
+    values[sheet_col - 1] = price
     ws.update(
-        f"A{row_num}:B{row_num}",
-        [[customer_name, price]],
+        f"A{row_num}:C{row_num}",
+        [values],
         value_input_option="USER_ENTERED",
     )
     _REF_CACHE["customers"] = None
 
 
-def get_dump_object_price(object_name: str) -> float | None:
-    """Возвращает последнюю сохранённую цену самосвала для объекта."""
-    initialize_sheets()
-    ws = _DIRECTORY_SHEETS["objects"]
-    rows = ws.get_all_values()
-    target = normalize(object_name)
-
-    for row in rows[1:]:
-        if row and normalize(row[0]) == target:
-            if len(row) < 2 or not str(row[1]).strip():
-                return None
-            try:
-                return float(str(row[1]).replace(" ", "").replace(",", "."))
-            except ValueError:
-                return None
-    return None
-
-
-def set_dump_object_price(object_name: str, price: float) -> None:
-    """Сохраняет последнюю цену самосвала за конкретным объектом."""
-    initialize_sheets()
-    ws = _DIRECTORY_SHEETS["objects"]
-    rows = ws.get_all_values()
-    target = normalize(object_name)
-
-    for row_num, row in enumerate(rows[1:], start=2):
-        if row and normalize(row[0]) == target:
-            ws.update_cell(row_num, 2, price)
-            _REF_CACHE["objects"] = None
-            return
-
-    row_num = first_empty_row(ws, 1)
-    ws.update(
-        f"A{row_num}:B{row_num}",
-        [[object_name, price]],
-        value_input_option="USER_ENTERED",
-    )
-    _REF_CACHE["objects"] = None
-
-
-async def prompt_dump_object_price(message, context: ContextTypes.DEFAULT_TYPE):
-    """Предлагает последнюю цену выбранного объекта при отчёте Самосвалов."""
+async def prompt_dump_customer_price(message, context: ContextTypes.DEFAULT_TYPE):
+    """Предлагает последнюю цену выбранного заказчика при отчёте Самосвалов."""
     d = context.user_data
     current = d["current"]
-    object_name = current.get("object", "")
-    saved = get_dump_object_price(object_name)
+    customer = current.get("customer", "")
+    saved = get_customer_price(customer, "dump")
     current["saved_price"] = saved
 
     if saved is None:
         d["step"] = "dump_rate"
-        await message.reply_text("Введите ставку для этого объекта или «-»:")
+        await message.reply_text("Введите ставку для этого заказчика или «-»:")
         return
 
     await message.reply_text(
-        f"Для объекта «{object_name}» последняя цена: {saved:g} ₽.",
+        f"Для заказчика «{customer}» последняя цена Самосвалов: {saved:g} ₽.",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
                         f"✅ Использовать {saved:g} ₽",
-                        callback_data="dumpobjprice|use",
+                        callback_data="dumpcustprice|use",
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         "✏️ Изменить цену",
-                        callback_data="dumpobjprice|change",
+                        callback_data="dumpcustprice|change",
                     )
                 ],
             ]
         ),
     )
 
+
+async def prompt_dump_object_price(message, context: ContextTypes.DEFAULT_TYPE):
+    """Совместимость: цена Самосвалов теперь хранится у заказчика."""
+    await prompt_dump_customer_price(message, context)
 
 
 async def prompt_special_price(message, context: ContextTypes.DEFAULT_TYPE):
@@ -2211,7 +2189,7 @@ async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: 
             )
         else:
             d["current"]["customer"] = value
-            await prompt_dump_object_price(message, context)
+            await prompt_dump_customer_price(message, context)
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2319,7 +2297,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if d["rate_type"] == "За рейс"
                 else "Введите новую ставку или «-»:"
             )
-    elif action == "dumpobjprice":
+    elif action == "dumpcustprice":
         choice = parts[1]
         current = d["current"]
         if choice == "use":
@@ -2505,9 +2483,10 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif step == "dump_rate":
             d["current"]["rate_trip"] = number_or_dash(value)
             if d["current"]["rate_trip"] != "-":
-                set_dump_object_price(
-                    d["current"]["object"],
+                set_customer_price(
+                    d["current"]["customer"],
                     float(d["current"]["rate_trip"]),
+                    "dump",
                 )
             d["step"] = "dump_trips"
             await update.message.reply_text("Введите количество рейсов или «-»:")
@@ -2792,18 +2771,18 @@ def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
         for col, formula in formulas.items():
             ws.update_cell(row_num, col, formula)
 
-        # Если вручную через бота изменили ставку, запоминаем её за объектом.
+        # Если через бота изменили ставку Самосвалов, сохраняем её за заказчиком.
         row = ws.row_values(row_num)
         row += [""] * max(0, len(DUMP_HEADERS) - len(row))
-        # После перестановки: Заказчик, Объект, Ставка...
         for base in (5, 11, 17, 23):
-            object_name = row[base + 1].strip() if len(row) > base + 1 else ""
+            customer_name = row[base].strip() if len(row) > base else ""
             price_text = row[base + 2].strip() if len(row) > base + 2 else ""
-            if object_name and price_text not in ("", "-"):
+            if customer_name and price_text not in ("", "-"):
                 try:
-                    set_dump_object_price(
-                        object_name,
-                        float(price_text.replace(" ", "").replace(",", "."))
+                    set_customer_price(
+                        customer_name,
+                        float(price_text.replace(" ", "").replace(",", ".")),
+                        "dump",
                     )
                 except ValueError:
                     pass
