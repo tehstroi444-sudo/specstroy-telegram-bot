@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.2-classic-filters-fixed"
+BOT_VERSION = "6.5.3-customer-price-persistence-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1540,48 +1540,129 @@ def add_ref(kind: str, value: str) -> tuple[bool, str]:
     return True, value
 
 
+def parse_price_value(value: Any) -> float | None:
+    """Преобразует цену из Google Sheets в число.
+
+    Поддерживает как сырые числа, так и отображаемые значения вида:
+    3 125,00 ₽ / 3125.00 / 3 125 ₽.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text == "-":
+        return None
+
+    # Убираем рубль, обычные/неразрывные пробелы и прочие символы,
+    # оставляя цифры, минус и разделители.
+    text = text.replace("\xa0", "").replace(" ", "").replace("₽", "")
+    text = re.sub(r"[^0-9,.\-]", "", text)
+
+    if not text:
+        return None
+
+    # Для русской записи 3.125,50: точки тысяч убираем, запятую делаем точкой.
+    if "," in text:
+        if "." in text and text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "")
+        text = text.replace(",", ".")
+    elif text.count(".") > 1:
+        # На случай 3.125.500
+        text = text.replace(".", "")
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def get_customer_price(customer_name: str, category: str = "special") -> float | None:
     """Возвращает последнюю цену заказчика для нужной категории."""
     initialize_sheets()
     ws = _DIRECTORY_SHEETS["customers"]
-    rows = ws.get_all_values()
     target = normalize(customer_name)
-    price_col = 1 if category == "special" else 2  # Python index: B или C
+    price_col = 1 if category == "special" else 2  # B или C, zero-based
+
+    # ВАЖНО: читаем сырые значения. Иначе денежный формат возвращает
+    # текст вида «3 125,00 ₽», который раньше не распознавался как число.
+    try:
+        rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    except TypeError:
+        rows = ws.get_all_values()
 
     for row in rows[1:]:
         if row and normalize(row[0]) == target:
-            if len(row) <= price_col or not str(row[price_col]).strip():
+            if len(row) <= price_col:
                 return None
-            try:
-                return float(str(row[price_col]).replace(" ", "").replace(",", "."))
-            except ValueError:
-                return None
+            return parse_price_value(row[price_col])
+
     return None
 
 
 def set_customer_price(customer_name: str, price: float, category: str = "special") -> None:
-    """Сохраняет последнюю цену заказчика для Спецтехники или Самосвалов."""
+    """Надёжно сохраняет последнюю цену заказчика."""
     initialize_sheets()
     ws = _DIRECTORY_SHEETS["customers"]
-    rows = ws.get_all_values()
     target = normalize(customer_name)
     sheet_col = 2 if category == "special" else 3
 
+    numeric_price = float(price)
+
+    try:
+        rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    except TypeError:
+        rows = ws.get_all_values()
+
+    target_row = None
     for row_num, row in enumerate(rows[1:], start=2):
         if row and normalize(row[0]) == target:
-            ws.update_cell(row_num, sheet_col, price)
-            _REF_CACHE["customers"] = None
-            return
+            target_row = row_num
+            break
 
-    row_num = first_empty_row(ws, 1)
-    values = [customer_name, "", ""]
-    values[sheet_col - 1] = price
-    ws.update(
-        f"A{row_num}:C{row_num}",
-        [values],
-        value_input_option="USER_ENTERED",
-    )
+    if target_row is None:
+        target_row = first_empty_row(ws, 1)
+        values = [customer_name, "", ""]
+        values[sheet_col - 1] = numeric_price
+        ws.update(
+            f"A{target_row}:C{target_row}",
+            [values],
+            value_input_option="USER_ENTERED",
+        )
+    else:
+        # Пишем только ячейку цены, не затрагивая вторую категорию.
+        ws.update(
+            f"{col_letter(sheet_col)}{target_row}",
+            [[numeric_price]],
+            value_input_option="USER_ENTERED",
+        )
+
+    # Сбрасываем только кэш списка; данные Google Sheets остаются источником истины.
     _REF_CACHE["customers"] = None
+
+    # Контрольное чтение. Не даём ошибке проверки сломать отчёт,
+    # но пишем в лог, если Google не вернул сохранённое значение.
+    try:
+        saved = ws.cell(target_row, sheet_col).value
+        parsed = parse_price_value(saved)
+        if parsed is None or abs(parsed - numeric_price) > 0.001:
+            logger.warning(
+                "Цена заказчика могла не сохраниться: %s, категория=%s, ожидалось=%s, получено=%r",
+                customer_name,
+                category,
+                numeric_price,
+                saved,
+            )
+        else:
+            logger.info(
+                "Цена заказчика сохранена: %s, категория=%s, цена=%s",
+                customer_name,
+                category,
+                numeric_price,
+            )
+    except Exception:
+        logger.exception("Не удалось проверить сохранение цены заказчика")
 
 
 async def prompt_dump_customer_price(message, context: ContextTypes.DEFAULT_TYPE):
@@ -1635,10 +1716,10 @@ async def prompt_special_price(message, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Введите примечание или «-»:")
         return
 
-    d["saved_object_price"] = saved
+    d["saved_customer_price"] = saved
     if saved is not None:
         await message.reply_text(
-            f"Для заказчика «{d['customer']}» сохранена цена: {saved:g} ₽.",
+            f"Для заказчика «{d['customer']}» последняя цена Спецтехники: {saved:g} ₽.",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton(f"✅ Использовать {saved:g} ₽", callback_data="custprice|use")],
@@ -2405,7 +2486,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "custprice":
         choice = parts[1]
         if choice == "use":
-            price = d.get("saved_object_price")
+            price = d.get("saved_customer_price")
             if price is None:
                 await q.edit_message_text("Сохранённая цена не найдена. Введите цену вручную.")
                 d["step"] = "rate_trip" if d["rate_type"] == "За рейс" else "rate"
