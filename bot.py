@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.3-customer-price-persistence-fixed"
+BOT_VERSION = "6.5.4-special-shift-formula"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -833,13 +833,32 @@ def migrate_remove_payment_status(ws) -> None:
         logger.info("Во вкладке %s удалена колонка Статус оплаты", ws.title)
 
 
-def special_amount_formula(row: int) -> str:
-    """Формула суммы спецтехники; обновляется при ручном редактировании таблицы."""
+def special_hours_formula(row: int) -> str:
+    """Формула отработанных часов для Спецтехники.
+
+    H = Начало, I = Окончание.
+    MOD корректно считает смену, которая закончилась после полуночи.
+    """
     return (
-        f'=IF(K{row}="-";"-";'
-        f'IF(K{row}="За час";IF(OR(L{row}="-";J{row}="-");"-";L{row}*J{row});'
-        f'IF(K{row}="За рейс";IF(OR(M{row}="-";N{row}="-");"-";M{row}*N{row});'
-        f'IF(L{row}="-";"-";L{row}))))'
+        f'=IF(OR(H{row}="";H{row}="-";I{row}="";I{row}="-");"-";'
+        f'ROUND(MOD(I{row}-H{row};1)*24;2))'
+    )
+
+
+def special_amount_formula(row: int) -> str:
+    """Автоматическая сумма за смену Спецтехники.
+
+    При ставке «За час»: Рабочее время × Ставка.
+    При ставке «За рейс»: Ставка за рейс × Рейс.
+    Формула пересчитывается Google Sheets при ручном изменении исходных ячеек.
+    """
+    return (
+        f'=IF(OR(K{row}="";K{row}="-");"-";'
+        f'IF(K{row}="За час";'
+        f'IF(OR(L{row}="";L{row}="-";J{row}="";J{row}="-");"-";ROUND(L{row}*J{row};2));'
+        f'IF(K{row}="За рейс";'
+        f'IF(OR(M{row}="";M{row}="-";N{row}="";N{row}="-");"-";ROUND(M{row}*N{row};2));'
+        f'IF(OR(L{row}="";L{row}="-");"-";L{row}))))'
     )
 
 
@@ -1159,14 +1178,23 @@ def apply_ruble_format(ws, header_name: str) -> None:
 def apply_report_formulas(special, dump) -> None:
     """Ставит формулы только на существующие строки отчётов."""
     try:
-        s_rows = special.get_all_values()
-        if len(s_rows) > 1:
-            formulas = [[special_amount_formula(r)] for r in range(2, len(s_rows) + 1)]
-            special.update(
-                f"O2:O{len(s_rows)}",
-                formulas,
-                value_input_option="USER_ENTERED",
-            )
+        # Формулы Спецтехники ставим с запасом, чтобы ручные изменения в таблице
+        # пересчитывались без участия Telegram-бота.
+        special_formula_last_row = min(max(special.row_count, 1000), 5000)
+
+        hours_formulas = [[special_hours_formula(r)] for r in range(2, special_formula_last_row + 1)]
+        amount_formulas = [[special_amount_formula(r)] for r in range(2, special_formula_last_row + 1)]
+
+        special.update(
+            f"J2:J{special_formula_last_row}",
+            hours_formulas,
+            value_input_option="USER_ENTERED",
+        )
+        special.update(
+            f"O2:O{special_formula_last_row}",
+            amount_formulas,
+            value_input_option="USER_ENTERED",
+        )
 
         d_rows = dump.get_all_values()
         if len(d_rows) > 1:
@@ -2871,6 +2899,7 @@ async def save_current_report(q, context):
             str(q.message.chat.id),
         ]
         row_num = save_row(special, row)
+        special.update_cell(row_num, 10, special_hours_formula(row_num))
         special.update_cell(row_num, 15, special_amount_formula(row_num))
         tab = SHEET_SPECIAL
     else:
@@ -2956,10 +2985,9 @@ def recalc_edited_report_row(ws, sheet_code: str, row_num: int) -> None:
     if sheet_code == "special":
         row = ws.row_values(row_num)
         row += [""] * max(0, len(SPECIAL_HEADERS) - len(row))
-        start, end = row[7], row[8]
-        if valid_time(start) and valid_time(end):
-            hours = work_hours(start, end)
-            ws.update_cell(row_num, 10, hours)
+        # Рабочее время и сумма — формулы Google Sheets.
+        # Поэтому изменение Начала/Окончания/Ставки сразу пересчитывает результат.
+        ws.update_cell(row_num, 10, special_hours_formula(row_num))
         ws.update_cell(row_num, 15, special_amount_formula(row_num))
 
         # Если изменена цена — сохраняем её за заказчиком.
