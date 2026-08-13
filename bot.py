@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.4-special-shift-formula"
+BOT_VERSION = "6.5.5-lunch-hour-formula"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -837,11 +837,13 @@ def special_hours_formula(row: int) -> str:
     """Формула отработанных часов для Спецтехники.
 
     H = Начало, I = Окончание.
+    Из общего времени смены автоматически вычитается 1 час обеда.
     MOD корректно считает смену, которая закончилась после полуночи.
+    Если смена короче 1 часа, результат не уходит в минус.
     """
     return (
         f'=IF(OR(H{row}="";H{row}="-";I{row}="";I{row}="-");"-";'
-        f'ROUND(MOD(I{row}-H{row};1)*24;2))'
+        f'MAX(0;ROUND(MOD(I{row}-H{row};1)*24-1;2)))'
     )
 
 
