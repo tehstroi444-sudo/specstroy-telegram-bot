@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.5-lunch-hour-formula"
+BOT_VERSION = "6.5.6-repeat-previous-day"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1876,6 +1876,116 @@ async def show_driver_management(message, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
+    """Ищет последний отчёт этой техники за предыдущий календарный день."""
+    try:
+        selected = datetime.strptime(work_date, "%d.%m.%Y")
+        previous_date = (selected - timedelta(days=1)).strftime("%d.%m.%Y")
+
+        special, _, _, _ = initialize_sheets()
+        rows = special.get_all_values()
+
+        # Идём снизу вверх: если за день было несколько записей, берём последнюю.
+        for row in reversed(rows[1:]):
+            padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
+            if padded[0].strip() != previous_date:
+                continue
+            if normalize(padded[3]) != normalize(plate):
+                continue
+
+            return {
+                "previous_date": previous_date,
+                "driver": padded[4].strip(),
+                "customer": padded[5].strip(),
+                "object": padded[6].strip(),
+                "start": padded[7].strip() or "-",
+                "end": padded[8].strip() or "-",
+                "rate_type": padded[10].strip() or "-",
+                "rate": padded[11].strip() or "-",
+                "rate_trip": padded[12].strip() or "-",
+                "trips": padded[13].strip() or "-",
+                "note": padded[15].strip() if len(padded) > 15 else "",
+            }
+
+        return None
+    except Exception:
+        logger.exception(
+            "Не удалось найти предыдущий отчёт Спецтехники: %s / %s",
+            work_date,
+            plate,
+        )
+        return None
+
+
+async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
+    """Предлагает повторить сведения предыдущего дня для выбранной спецтехники."""
+    d = context.user_data
+
+    if d.get("category") != "special":
+        await ask_machine_driver(message, context)
+        return
+
+    previous = get_previous_special_report(d["work_date"], d["plate"])
+    if not previous:
+        await ask_machine_driver(message, context)
+        return
+
+    d["previous_special"] = previous
+    d["step"] = "previous_special_offer"
+
+    text = (
+        f"Нашёл отчёт по этой технике за {previous['previous_date']}.\n\n"
+        f"Водитель: {previous['driver'] or '—'}\n"
+        f"Заказчик: {previous['customer'] or '—'}\n"
+        f"Объект: {previous['object'] or '—'}\n"
+        f"Время: {previous['start']}–{previous['end']}\n"
+        f"Вид ставки: {previous['rate_type']}\n"
+        f"Ставка: {previous['rate']}\n"
+        f"Ставка за рейс: {previous['rate_trip']}\n"
+        f"Рейс: {previous['trips']}\n\n"
+        "Повторить эти сведения?"
+    )
+
+    await message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔁 Повторить сведения",
+                        callback_data="prevspecial|repeat",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✍️ Заполнить заново",
+                        callback_data="prevspecial|new",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+def apply_previous_special_report(d: dict[str, Any]) -> None:
+    """Копирует предыдущий отчёт в текущий, оставляя выбранную новую дату."""
+    previous = d["previous_special"]
+
+    d["driver"] = previous["driver"]
+    d["customer"] = previous["customer"]
+    d["object"] = previous["object"]
+    d["start"] = previous["start"]
+    d["end"] = previous["end"]
+    d["hours"] = work_hours(d["start"], d["end"])
+    d["rate_type"] = previous["rate_type"]
+    d["rate"] = previous["rate"]
+    d["rate_trip"] = previous["rate_trip"]
+    d["trips"] = previous["trips"]
+    d["note"] = previous["note"]
+    d["amount"] = calc_special(d)
+
+
+
 async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     assigned = drivers_for_plate(d["plate"])
@@ -2451,14 +2561,41 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if choice == "0":
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
-            await ask_machine_driver(q.message, context)
+            await offer_previous_special_or_continue(q.message, context)
         elif choice == "1":
             d["work_date"] = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
-            await ask_machine_driver(q.message, context)
+            await offer_previous_special_or_continue(q.message, context)
         else:
             d["step"] = "date_manual"
             await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:")
+    elif action == "prevspecial":
+        choice = parts[1]
+
+        if choice == "repeat":
+            previous = d.get("previous_special")
+            if not previous:
+                await q.edit_message_text(
+                    "Предыдущий отчёт уже недоступен. Заполните сведения заново."
+                )
+                await ask_machine_driver(q.message, context)
+                return
+
+            apply_previous_special_report(d)
+            d["step"] = "confirm"
+
+            await q.edit_message_text(
+                "✅ Сведения предыдущего дня перенесены на выбранную дату."
+            )
+            await q.message.reply_text(
+                summary(d),
+                reply_markup=buttons(["Сохранить", "Отменить"], "confirm"),
+            )
+        else:
+            d.pop("previous_special", None)
+            await q.edit_message_text("Заполняем сведения заново.")
+            await ask_machine_driver(q.message, context)
+
     elif action == "machdriver":
         assigned = drivers_for_plate(d["plate"])
         d["driver"] = assigned[int(parts[1])][0]
@@ -2666,7 +2803,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "date_manual":
             datetime.strptime(value, "%d.%m.%Y")
             d["work_date"] = value
-            await ask_machine_driver(update.message, context)
+            await offer_previous_special_or_continue(update.message, context)
         elif step == "add_machine_driver":
             ok, result = add_driver_for_plate(d["model"], d["plate"], value)
             if not ok:
