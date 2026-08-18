@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.1-previous-day-lookup-fixed"
+BOT_VERSION = "6.6.2-previous-info-reliable"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1919,16 +1919,18 @@ def parse_sheet_date(value: Any):
     if not text:
         return None
 
-    # Основные форматы, которые могут быть в таблице.
-    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"):
+    m = re.search(r"(\\d{1,2}[./]\\d{1,2}[./]\\d{2,4})", text)
+    if m:
+        text = m.group(1)
+
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             pass
 
-    # Иногда Sheets/API может вернуть числовой serial date.
     try:
-        serial = float(text.replace(",", "."))
+        serial = float(str(value).replace(",", "."))
         if serial > 1000:
             return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
     except (ValueError, TypeError):
@@ -1937,53 +1939,77 @@ def parse_sheet_date(value: Any):
     return None
 
 
-def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
-    """Ищет отчёт именно этой техники за предыдущий календарный день.
+def get_previous_special_report(
+    work_date: str,
+    plate: str,
+    model: str = "",
+    equipment_name: str = "",
+) -> dict[str, Any] | None:
+    """Ищет предыдущие сведения по выбранной единице техники.
 
-    Сценарий:
-    техника -> дата -> сведения предыдущего дня / новые сведения.
-    Поиск выполняется строго по госномеру и строго за день перед выбранной датой.
+    Сначала ищет вчерашний отчёт. Если его нет, берёт последний более ранний
+    отчёт этой же машины. Основной ключ — госномер, резервный — модель.
     """
     try:
         selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
-        previous_date = selected_date - timedelta(days=1)
-        previous_date_text = previous_date.strftime("%d.%m.%Y")
+        yesterday = selected_date - timedelta(days=1)
 
         special, _, _, _ = initialize_sheets()
 
-        # Важно читать ОТОБРАЖАЕМЫЕ значения:
-        # тогда дата из Google Sheets остаётся строкой ДД.ММ.ГГГГ,
-        # а не серийным числом даты.
         try:
             rows = special.get_all_values(value_render_option="FORMATTED_VALUE")
         except TypeError:
             rows = special.get_all_values()
 
-        matches = []
+        plate_key = normalize_plate(plate)
+        model_key = normalize(model)
+        name_key = normalize(equipment_name)
 
-        for row in rows[1:]:
+        candidates = []
+
+        for row_index, row in enumerate(rows[1:], start=2):
             padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
 
-            row_date_raw = padded[0]
+            row_date = parse_sheet_date(padded[0])
+            if row_date is None or row_date >= selected_date:
+                continue
+
+            row_name = str(padded[1]).strip()
+            row_model = str(padded[2]).strip()
             row_plate = str(padded[3]).strip()
 
-            if normalize_plate(row_plate) != normalize_plate(plate):
+            same_plate = bool(plate_key) and normalize_plate(row_plate) == plate_key
+            same_model = bool(model_key) and normalize(row_model) == model_key
+            same_name_model = (
+                bool(name_key)
+                and bool(model_key)
+                and normalize(row_name) == name_key
+                and normalize(row_model) == model_key
+            )
+
+            if not (same_plate or same_model or same_name_model):
                 continue
 
-            row_date = parse_sheet_date(row_date_raw)
-            if row_date != previous_date:
-                continue
+            candidates.append((row_date, row_index, padded, same_plate))
 
-            matches.append(padded)
-
-        if not matches:
+        if not candidates:
+            logger.info(
+                "Предыдущие сведения не найдены: дата=%s, госномер=%s, модель=%s",
+                work_date, plate, model,
+            )
             return None
 
-        # Если за вчера по одной машине несколько строк, берём последнюю запись.
-        padded = matches[-1]
+        yesterday_rows = [x for x in candidates if x[0] == yesterday]
+        if yesterday_rows:
+            yesterday_rows.sort(key=lambda x: (x[3], x[1]))
+            report_date, _, padded, _ = yesterday_rows[-1]
+        else:
+            candidates.sort(key=lambda x: (x[0], x[3], x[1]))
+            report_date, _, padded, _ = candidates[-1]
 
         return {
-            "previous_date": previous_date_text,
+            "previous_date": report_date.strftime("%d.%m.%Y"),
+            "is_yesterday": report_date == yesterday,
             "driver": str(padded[4]).strip(),
             "customer": str(padded[5]).strip(),
             "object": str(padded[6]).strip(),
@@ -1998,48 +2024,58 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
 
     except Exception:
         logger.exception(
-            "Не удалось найти отчёт предыдущего дня: дата=%s, госномер=%s",
-            work_date,
-            plate,
+            "Ошибка поиска предыдущих сведений: дата=%s, госномер=%s, модель=%s",
+            work_date, plate, model,
         )
         return None
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """После выбора техники и даты предлагает: вчерашние сведения или новые."""
+    """После выбора техники и даты предлагает предыдущие сведения или новые."""
     d = context.user_data
 
     if d.get("category") != "special":
         await ask_machine_driver(message, context)
         return
 
-    previous = get_previous_special_report(d["work_date"], d["plate"])
+    previous = get_previous_special_report(
+        d["work_date"],
+        d["plate"],
+        d.get("model", ""),
+        d.get("name", ""),
+    )
     d["previous_special"] = previous
     d["step"] = "previous_special_offer"
 
     machine_title = f"{d.get('model', '')} — {d.get('plate', '')}".strip(" —")
-    selected_date = datetime.strptime(d["work_date"], "%d.%m.%Y").date()
-    previous_date_text = (selected_date - timedelta(days=1)).strftime("%d.%m.%Y")
 
     if previous:
+        if previous.get("is_yesterday"):
+            found_line = f"Нашёл сведения за предыдущий день — {previous['previous_date']}:"
+        else:
+            found_line = (
+                f"За предыдущий день записи нет. "
+                f"Нашёл последние сведения — {previous['previous_date']}:"
+            )
+
         text = (
-            f"{machine_title}\n"
-            f"Дата отчёта: {d['work_date']}\n\n"
-            f"Нашёл сведения за предыдущий день — {previous_date_text}:\n"
-            f"Водитель: {previous['driver'] or '—'}\n"
-            f"Заказчик: {previous['customer'] or '—'}\n"
-            f"Объект: {previous['object'] or '—'}\n"
-            f"Время: {previous['start']}–{previous['end']}\n"
-            f"Вид ставки: {previous['rate_type']}\n"
-            f"Ставка: {previous['rate']}\n"
-            f"Ставка за рейс: {previous['rate_trip']}\n"
-            f"Рейс: {previous['trips']}\n\n"
+            f"{machine_title}\\n"
+            f"Дата отчёта: {d['work_date']}\\n\\n"
+            f"{found_line}\\n"
+            f"Водитель: {previous['driver'] or '—'}\\n"
+            f"Заказчик: {previous['customer'] or '—'}\\n"
+            f"Объект: {previous['object'] or '—'}\\n"
+            f"Время: {previous['start']}–{previous['end']}\\n"
+            f"Вид ставки: {previous['rate_type']}\\n"
+            f"Ставка: {previous['rate']}\\n"
+            f"Ставка за рейс: {previous['rate_trip']}\\n"
+            f"Рейс: {previous['trips']}\\n\\n"
             "Как заполнить отчёт?"
         )
         rows = [
             [
                 InlineKeyboardButton(
-                    f"🔁 Взять сведения за {previous_date_text}",
+                    f"🔁 Взять сведения за {previous['previous_date']}",
                     callback_data="prevspecial|repeat",
                 )
             ],
@@ -2058,10 +2094,11 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
         ]
     else:
         text = (
-            f"{machine_title}\n"
-            f"Дата отчёта: {d['work_date']}\n\n"
-            f"За предыдущий день ({previous_date_text}) сведений по этой технике не найдено.\n"
-            f"Поиск выполнен по госномеру: {d.get('plate', '—')}\n\n"
+            f"{machine_title}\\n"
+            f"Дата отчёта: {d['work_date']}\\n\\n"
+            "Предыдущих сведений по этой технике не найдено.\\n"
+            f"Проверено по госномеру {d.get('plate', '—')} "
+            f"и модели {d.get('model', '—')}.\\n\\n"
             "Можно заполнить новые сведения."
         )
         rows = [
