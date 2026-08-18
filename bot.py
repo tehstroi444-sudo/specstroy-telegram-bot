@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.8-repeat-previous-fixed"
+BOT_VERSION = "6.5.9-repeat-for-every-machine"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1891,37 +1891,73 @@ def previous_report_number(value: Any) -> float | str:
 
 
 def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
-    """Ищет последний отчёт этой техники за предыдущий календарный день."""
+    """Ищет последний предыдущий отчёт именно этой единицы техники.
+
+    Сначала берётся отчёт за предыдущий календарный день.
+    Если в этот день техника не работала, берётся самый свежий отчёт
+    по этому же госномеру до выбранной даты.
+    """
     try:
-        selected = datetime.strptime(work_date, "%d.%m.%Y")
-        previous_date = (selected - timedelta(days=1)).strftime("%d.%m.%Y")
+        selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
+        previous_calendar_date = selected_date - timedelta(days=1)
 
         special, _, _, _ = initialize_sheets()
-        rows = special.get_all_values()
 
-        # Идём снизу вверх: если за день было несколько записей, берём последнюю.
-        for row in reversed(rows[1:]):
+        try:
+            rows = special.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        except TypeError:
+            rows = special.get_all_values()
+
+        candidates = []
+
+        for row in rows[1:]:
             padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
-            if padded[0].strip() != previous_date:
-                continue
+
+            # Ключ единицы техники — госномер. Так функция работает независимо
+            # от названия/модели и для каждой машины отдельно.
             if normalize(padded[3]) != normalize(plate):
                 continue
 
-            return {
-                "previous_date": previous_date,
-                "driver": padded[4].strip(),
-                "customer": padded[5].strip(),
-                "object": padded[6].strip(),
-                "start": padded[7].strip() or "-",
-                "end": padded[8].strip() or "-",
-                "rate_type": padded[10].strip() or "-",
-                "rate": previous_report_number(padded[11]),
-                "rate_trip": previous_report_number(padded[12]),
-                "trips": previous_report_number(padded[13]),
-                "note": padded[15].strip() if len(padded) > 15 else "",
-            }
+            date_text = str(padded[0]).strip()
+            if not date_text:
+                continue
 
-        return None
+            try:
+                report_date = datetime.strptime(date_text, "%d.%m.%Y").date()
+            except ValueError:
+                continue
+
+            # Не копируем отчёт из будущего или с той же выбранной даты.
+            if report_date >= selected_date:
+                continue
+
+            candidates.append((report_date, padded))
+
+        if not candidates:
+            return None
+
+        # Приоритет: вчера. Если вчера записи нет — самая свежая более ранняя.
+        yesterday = [item for item in candidates if item[0] == previous_calendar_date]
+        report_date, padded = (
+            yesterday[-1]
+            if yesterday
+            else max(candidates, key=lambda item: item[0])
+        )
+
+        return {
+            "previous_date": report_date.strftime("%d.%m.%Y"),
+            "driver": str(padded[4]).strip(),
+            "customer": str(padded[5]).strip(),
+            "object": str(padded[6]).strip(),
+            "start": str(padded[7]).strip() or "-",
+            "end": str(padded[8]).strip() or "-",
+            "rate_type": str(padded[10]).strip() or "-",
+            "rate": previous_report_number(padded[11]),
+            "rate_trip": previous_report_number(padded[12]),
+            "trips": previous_report_number(padded[13]),
+            "note": str(padded[15]).strip() if len(padded) > 15 else "",
+        }
+
     except Exception:
         logger.exception(
             "Не удалось найти предыдущий отчёт Спецтехники: %s / %s",
@@ -1932,7 +1968,7 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """Предлагает повторить сведения предыдущего дня для выбранной спецтехники."""
+    """Показывает возможность повторить сведения для каждой единицы Спецтехники."""
     d = context.user_data
 
     if d.get("category") != "special":
@@ -1940,29 +1976,26 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
         return
 
     previous = get_previous_special_report(d["work_date"], d["plate"])
-    if not previous:
-        await ask_machine_driver(message, context)
-        return
-
     d["previous_special"] = previous
     d["step"] = "previous_special_offer"
 
-    text = (
-        f"Нашёл отчёт по этой технике за {previous['previous_date']}.\n\n"
-        f"Водитель: {previous['driver'] or '—'}\n"
-        f"Заказчик: {previous['customer'] or '—'}\n"
-        f"Объект: {previous['object'] or '—'}\n"
-        f"Время: {previous['start']}–{previous['end']}\n"
-        f"Вид ставки: {previous['rate_type']}\n"
-        f"Ставка: {previous['rate']}\n"
-        f"Ставка за рейс: {previous['rate_trip']}\n"
-        f"Рейс: {previous['trips']}\n\n"
-        "Повторить эти сведения?"
-    )
+    machine_title = f"{d.get('model', '')} — {d.get('plate', '')}".strip(" —")
 
-    await message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
+    if previous:
+        text = (
+            f"{machine_title}\n"
+            f"Последний предыдущий отчёт: {previous['previous_date']}.\n\n"
+            f"Водитель: {previous['driver'] or '—'}\n"
+            f"Заказчик: {previous['customer'] or '—'}\n"
+            f"Объект: {previous['object'] or '—'}\n"
+            f"Время: {previous['start']}–{previous['end']}\n"
+            f"Вид ставки: {previous['rate_type']}\n"
+            f"Ставка: {previous['rate']}\n"
+            f"Ставка за рейс: {previous['rate_trip']}\n"
+            f"Рейс: {previous['trips']}\n\n"
+            "Повторить эти сведения для выбранной даты?"
+        )
+        keyboard = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
@@ -1976,9 +2009,40 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
                         callback_data="prevspecial|new",
                     )
                 ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data="reportback|0",
+                    )
+                ],
             ]
-        ),
-    )
+        )
+    else:
+        # Кнопка/этап существует для каждой единицы. Если история этой машины
+        # пока пустая, сообщаем об этом и даём обычное заполнение.
+        text = (
+            f"{machine_title}\n\n"
+            "По этой единице техники предыдущих отчётов пока нет. "
+            "Повторять нечего — заполните первый отчёт вручную."
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✍️ Заполнить сведения",
+                        callback_data="prevspecial|new",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад",
+                        callback_data="reportback|0",
+                    )
+                ],
+            ]
+        )
+
+    await message.reply_text(text, reply_markup=keyboard)
 
 
 def apply_previous_special_report(d: dict[str, Any]) -> None:
@@ -2743,7 +2807,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 previous = d.get("previous_special")
                 if not previous:
                     await q.edit_message_text(
-                        "Предыдущий отчёт уже недоступен. Заполните сведения заново."
+                        "Для этой единицы техники предыдущий отчёт не найден. Заполните сведения заново."
                     )
                     await ask_machine_driver(q.message, context)
                     return
