@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.0-previous-day-flow-fixed"
+BOT_VERSION = "6.6.1-previous-day-lookup-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -313,8 +313,28 @@ def ensure_sheet(spreadsheet, title: str, headers: list[str], rows: int = 1000):
     return ws
 
 def normalize_plate(value: str) -> str:
-    """Нормализует госномер для сопоставления, не меняя отображаемое значение."""
-    return re.sub(r"[^0-9A-ZА-ЯЁ]", "", str(value or "").upper())
+    """Нормализует госномер для надёжного сопоставления.
+
+    Учитывает пробелы и визуально одинаковые латинские/кириллические буквы
+    в госномерах: A/А, B/В, C/С, E/Е, H/Н, K/К, M/М, O/О, P/Р, T/Т, X/Х.
+    """
+    text = re.sub(r"[^0-9A-ZА-ЯЁ]", "", str(value or "").upper())
+
+    latin_to_cyr = str.maketrans({
+        "A": "А",
+        "B": "В",
+        "C": "С",
+        "E": "Е",
+        "H": "Н",
+        "K": "К",
+        "M": "М",
+        "O": "О",
+        "P": "Р",
+        "T": "Т",
+        "X": "Х",
+        "Y": "У",
+    })
+    return text.translate(latin_to_cyr)
 
 
 def migrate_osago_sheet(ws) -> None:
@@ -1890,6 +1910,33 @@ def previous_report_number(value: Any) -> float | str:
     return "-" if parsed is None else parsed
 
 
+def parse_sheet_date(value: Any):
+    """Преобразует дату из Google Sheets в date, поддерживая разные отображения."""
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Основные форматы, которые могут быть в таблице.
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    # Иногда Sheets/API может вернуть числовой serial date.
+    try:
+        serial = float(text.replace(",", "."))
+        if serial > 1000:
+            return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+    except (ValueError, TypeError):
+        pass
+
+    return None
+
+
 def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
     """Ищет отчёт именно этой техники за предыдущий календарный день.
 
@@ -1917,12 +1964,14 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
         for row in rows[1:]:
             padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
 
-            row_date = str(padded[0]).strip()
+            row_date_raw = padded[0]
             row_plate = str(padded[3]).strip()
 
-            if normalize(row_plate) != normalize(plate):
+            if normalize_plate(row_plate) != normalize_plate(plate):
                 continue
-            if row_date != previous_date_text:
+
+            row_date = parse_sheet_date(row_date_raw)
+            if row_date != previous_date:
                 continue
 
             matches.append(padded)
@@ -2011,7 +2060,8 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
         text = (
             f"{machine_title}\n"
             f"Дата отчёта: {d['work_date']}\n\n"
-            f"За предыдущий день ({previous_date_text}) сведений по этой технике нет.\n\n"
+            f"За предыдущий день ({previous_date_text}) сведений по этой технике не найдено.\n"
+            f"Поиск выполнен по госномеру: {d.get('plate', '—')}\n\n"
             "Можно заполнить новые сведения."
         )
         rows = [
