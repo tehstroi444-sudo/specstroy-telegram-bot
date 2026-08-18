@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.9-repeat-for-every-machine"
+BOT_VERSION = "6.6.0-previous-day-flow-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1891,61 +1891,50 @@ def previous_report_number(value: Any) -> float | str:
 
 
 def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
-    """Ищет последний предыдущий отчёт именно этой единицы техники.
+    """Ищет отчёт именно этой техники за предыдущий календарный день.
 
-    Сначала берётся отчёт за предыдущий календарный день.
-    Если в этот день техника не работала, берётся самый свежий отчёт
-    по этому же госномеру до выбранной даты.
+    Сценарий:
+    техника -> дата -> сведения предыдущего дня / новые сведения.
+    Поиск выполняется строго по госномеру и строго за день перед выбранной датой.
     """
     try:
         selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
-        previous_calendar_date = selected_date - timedelta(days=1)
+        previous_date = selected_date - timedelta(days=1)
+        previous_date_text = previous_date.strftime("%d.%m.%Y")
 
         special, _, _, _ = initialize_sheets()
 
+        # Важно читать ОТОБРАЖАЕМЫЕ значения:
+        # тогда дата из Google Sheets остаётся строкой ДД.ММ.ГГГГ,
+        # а не серийным числом даты.
         try:
-            rows = special.get_all_values(value_render_option="UNFORMATTED_VALUE")
+            rows = special.get_all_values(value_render_option="FORMATTED_VALUE")
         except TypeError:
             rows = special.get_all_values()
 
-        candidates = []
+        matches = []
 
         for row in rows[1:]:
             padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
 
-            # Ключ единицы техники — госномер. Так функция работает независимо
-            # от названия/модели и для каждой машины отдельно.
-            if normalize(padded[3]) != normalize(plate):
+            row_date = str(padded[0]).strip()
+            row_plate = str(padded[3]).strip()
+
+            if normalize(row_plate) != normalize(plate):
+                continue
+            if row_date != previous_date_text:
                 continue
 
-            date_text = str(padded[0]).strip()
-            if not date_text:
-                continue
+            matches.append(padded)
 
-            try:
-                report_date = datetime.strptime(date_text, "%d.%m.%Y").date()
-            except ValueError:
-                continue
-
-            # Не копируем отчёт из будущего или с той же выбранной даты.
-            if report_date >= selected_date:
-                continue
-
-            candidates.append((report_date, padded))
-
-        if not candidates:
+        if not matches:
             return None
 
-        # Приоритет: вчера. Если вчера записи нет — самая свежая более ранняя.
-        yesterday = [item for item in candidates if item[0] == previous_calendar_date]
-        report_date, padded = (
-            yesterday[-1]
-            if yesterday
-            else max(candidates, key=lambda item: item[0])
-        )
+        # Если за вчера по одной машине несколько строк, берём последнюю запись.
+        padded = matches[-1]
 
         return {
-            "previous_date": report_date.strftime("%d.%m.%Y"),
+            "previous_date": previous_date_text,
             "driver": str(padded[4]).strip(),
             "customer": str(padded[5]).strip(),
             "object": str(padded[6]).strip(),
@@ -1960,7 +1949,7 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
 
     except Exception:
         logger.exception(
-            "Не удалось найти предыдущий отчёт Спецтехники: %s / %s",
+            "Не удалось найти отчёт предыдущего дня: дата=%s, госномер=%s",
             work_date,
             plate,
         )
@@ -1968,7 +1957,7 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает возможность повторить сведения для каждой единицы Спецтехники."""
+    """После выбора техники и даты предлагает: вчерашние сведения или новые."""
     d = context.user_data
 
     if d.get("category") != "special":
@@ -1980,11 +1969,14 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
     d["step"] = "previous_special_offer"
 
     machine_title = f"{d.get('model', '')} — {d.get('plate', '')}".strip(" —")
+    selected_date = datetime.strptime(d["work_date"], "%d.%m.%Y").date()
+    previous_date_text = (selected_date - timedelta(days=1)).strftime("%d.%m.%Y")
 
     if previous:
         text = (
             f"{machine_title}\n"
-            f"Последний предыдущий отчёт: {previous['previous_date']}.\n\n"
+            f"Дата отчёта: {d['work_date']}\n\n"
+            f"Нашёл сведения за предыдущий день — {previous_date_text}:\n"
             f"Водитель: {previous['driver'] or '—'}\n"
             f"Заказчик: {previous['customer'] or '—'}\n"
             f"Объект: {previous['object'] or '—'}\n"
@@ -1993,56 +1985,51 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
             f"Ставка: {previous['rate']}\n"
             f"Ставка за рейс: {previous['rate_trip']}\n"
             f"Рейс: {previous['trips']}\n\n"
-            "Повторить эти сведения для выбранной даты?"
+            "Как заполнить отчёт?"
         )
-        keyboard = InlineKeyboardMarkup(
+        rows = [
             [
-                [
-                    InlineKeyboardButton(
-                        "🔁 Повторить сведения",
-                        callback_data="prevspecial|repeat",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✍️ Заполнить заново",
-                        callback_data="prevspecial|new",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="reportback|0",
-                    )
-                ],
-            ]
-        )
+                InlineKeyboardButton(
+                    f"🔁 Взять сведения за {previous_date_text}",
+                    callback_data="prevspecial|repeat",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✍️ Заполнить новые сведения",
+                    callback_data="prevspecial|new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад к дате",
+                    callback_data="reportback|0",
+                )
+            ],
+        ]
     else:
-        # Кнопка/этап существует для каждой единицы. Если история этой машины
-        # пока пустая, сообщаем об этом и даём обычное заполнение.
         text = (
-            f"{machine_title}\n\n"
-            "По этой единице техники предыдущих отчётов пока нет. "
-            "Повторять нечего — заполните первый отчёт вручную."
+            f"{machine_title}\n"
+            f"Дата отчёта: {d['work_date']}\n\n"
+            f"За предыдущий день ({previous_date_text}) сведений по этой технике нет.\n\n"
+            "Можно заполнить новые сведения."
         )
-        keyboard = InlineKeyboardMarkup(
+        rows = [
             [
-                [
-                    InlineKeyboardButton(
-                        "✍️ Заполнить сведения",
-                        callback_data="prevspecial|new",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад",
-                        callback_data="reportback|0",
-                    )
-                ],
-            ]
-        )
+                InlineKeyboardButton(
+                    "✍️ Заполнить новые сведения",
+                    callback_data="prevspecial|new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад к дате",
+                    callback_data="reportback|0",
+                )
+            ],
+        ]
 
-    await message.reply_text(text, reply_markup=keyboard)
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 def apply_previous_special_report(d: dict[str, Any]) -> None:
@@ -2791,11 +2778,17 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if choice == "0":
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
-            await offer_previous_special_or_continue(q.message, context)
+            if d.get("category") == "special":
+                await offer_previous_special_or_continue(q.message, context)
+            else:
+                await ask_machine_driver(q.message, context)
         elif choice == "1":
             d["work_date"] = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
-            await offer_previous_special_or_continue(q.message, context)
+            if d.get("category") == "special":
+                await offer_previous_special_or_continue(q.message, context)
+            else:
+                await ask_machine_driver(q.message, context)
         else:
             d["step"] = "date_manual"
             await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:", reply_markup=back_markup())
@@ -2816,7 +2809,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 d["step"] = "confirm"
 
                 await q.edit_message_text(
-                    "✅ Сведения предыдущего дня перенесены на выбранную дату."
+                    "✅ Сведения за предыдущий день перенесены на выбранную дату."
                 )
                 await q.message.reply_text(
                     summary(d),
@@ -3054,7 +3047,10 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "date_manual":
             datetime.strptime(value, "%d.%m.%Y")
             d["work_date"] = value
-            await offer_previous_special_or_continue(update.message, context)
+            if d.get("category") == "special":
+                await offer_previous_special_or_continue(update.message, context)
+            else:
+                await ask_machine_driver(update.message, context)
         elif step == "add_machine_driver":
             ok, result = add_driver_for_plate(d["model"], d["plate"], value)
             if not ok:
