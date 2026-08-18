@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.6-repeat-previous-day"
+BOT_VERSION = "6.5.7-back-during-report"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1996,6 +1996,7 @@ async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
     rows.append([InlineKeyboardButton("👷 Выбрать из общего списка", callback_data="driverother|0")])
     rows.append([InlineKeyboardButton("➕ Добавить водителя для этой техники", callback_data="driveraddmachine|0")])
     rows.append([InlineKeyboardButton("⚙️ Управление водителями", callback_data="drivermanage|0")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reportback|0")])
     await message.reply_text("Выберите водителя для этой техники:", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -2483,6 +2484,147 @@ async def refs_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def back_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data="reportback|0")]]
+    )
+
+
+def with_back(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
+    """Добавляет кнопку «Назад» к существующей inline-клавиатуре."""
+    rows = []
+    if markup is not None:
+        rows = [list(row) for row in markup.inline_keyboard]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reportback|0")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_special_step_from_data(message, context: ContextTypes.DEFAULT_TYPE, target: str):
+    """Возвращает пользователя на нужный этап отчёта Спецтехники."""
+    d = context.user_data
+
+    if target == "machine":
+        d["step"] = "machine"
+        await message.reply_text(
+            "Выберите технику:",
+            reply_markup=with_back(machine_keyboard(SPECIAL_EQUIPMENT)),
+        )
+    elif target == "date":
+        d["step"] = "date_choice"
+        await message.reply_text(
+            "Укажите дату работы:",
+            reply_markup=with_back(buttons(["Сегодня", "Завтра", "Другая дата"], "date")),
+        )
+    elif target == "driver":
+        await ask_machine_driver(message, context)
+    elif target == "start":
+        d["step"] = "start_time"
+        await message.reply_text(
+            f"Текущее начало: {d.get('start', '—')}\nВведите время начала ЧЧ:ММ или «-»:",
+            reply_markup=back_markup(),
+        )
+    elif target == "end":
+        d["step"] = "end_time"
+        await message.reply_text(
+            f"Текущее окончание: {d.get('end', '—')}\nВведите время окончания ЧЧ:ММ или «-»:",
+            reply_markup=back_markup(),
+        )
+    elif target == "object":
+        await ask_ref(message, context, "objects", "special_object")
+    elif target == "customer":
+        await ask_ref(message, context, "customers", "special_customer", include_none=True)
+    elif target == "rate_type":
+        d["step"] = "rate_type"
+        await message.reply_text(
+            "Выберите вид ставки:",
+            reply_markup=with_back(buttons(RATE_TYPES, "ratetype")),
+        )
+    elif target == "price":
+        await prompt_special_price(message, context)
+    elif target == "trips":
+        d["step"] = "trips"
+        await message.reply_text(
+            f"Текущее количество рейсов: {d.get('trips', '—')}\nВведите количество рейсов или «-»:",
+            reply_markup=back_markup(),
+        )
+    elif target == "note":
+        d["step"] = "note"
+        await message.reply_text(
+            f"Текущее примечание: {d.get('note') or '—'}\nВведите примечание или «-»:",
+            reply_markup=back_markup(),
+        )
+
+
+async def go_back_in_report(message, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг назад во время заполнения отчёта без потери уже введённых данных."""
+    d = context.user_data
+    category = d.get("category")
+    step = d.get("step")
+
+    if category == "special":
+        mapping = {
+            "date_choice": "machine",
+            "date_manual": "date",
+            "previous_special_offer": "date",
+            "start_time": "driver",
+            "end_time": "start",
+            "ref_choice": None,
+            "ref_search_query": None,
+            "rate_type": "customer",
+            "rate": "rate_type",
+            "rate_trip": "rate_type",
+            "trips": "price",
+            "note": "trips" if d.get("rate_type") == "За рейс" else "price",
+            "confirm": "note",
+        }
+
+        # Для справочников понимаем, что именно сейчас выбирается.
+        if step in ("ref_choice", "ref_search_query"):
+            kind = d.get("ref_kind")
+            next_step = d.get("ref_next_step")
+            if kind == "objects":
+                target = "end"
+            elif kind == "customers" and next_step == "special_customer":
+                target = "object"
+            elif kind == "drivers":
+                target = "driver"
+            else:
+                target = "end"
+        else:
+            target = mapping.get(step)
+
+        if target:
+            await show_special_step_from_data(message, context, target)
+        else:
+            await message.reply_text("Это первый шаг отчёта.", reply_markup=menu())
+        return
+
+    # Самосвалы: сохраняем возможность вернуться хотя бы к предыдущему
+    # логическому блоку без отмены всего отчёта.
+    if category == "dump":
+        if step in ("object_count", "ref_choice", "ref_search_query"):
+            await ask_machine_driver(message, context)
+        elif step in ("dump_rate", "dump_trips", "dump_volume"):
+            # Возвращаемся к выбору текущего объекта/заказчика.
+            await ask_ref(message, context, "objects", "dump_object")
+        elif step == "note":
+            d["step"] = "object_count"
+            await message.reply_text(
+                "Сколько объектов?",
+                reply_markup=with_back(buttons(["1", "2", "3", "4"], "objcount")),
+            )
+        elif step == "confirm":
+            d["step"] = "note"
+            await message.reply_text(
+                f"Текущее примечание: {d.get('note') or '—'}\nВведите примечание или «-»:",
+                reply_markup=back_markup(),
+            )
+        else:
+            await message.reply_text("Вернитесь к предыдущему шагу.", reply_markup=back_markup())
+
+
+
+
 async def ask_ref(message, context: ContextTypes.DEFAULT_TYPE, kind: str, next_step: str, include_none: bool = False):
     context.user_data["ref_next_step"] = next_step
     context.user_data["ref_kind"] = kind
@@ -2491,7 +2633,7 @@ async def ask_ref(message, context: ContextTypes.DEFAULT_TYPE, kind: str, next_s
     label = {"drivers": "водителя", "objects": "объект", "customers": "заказчика"}[kind]
     await message.reply_text(
         f"Выберите {label}: поиск по сохранённым данным или добавление нового.",
-        reply_markup=ref_search_keyboard(kind, include_none=include_none),
+        reply_markup=with_back(ref_search_keyboard(kind, include_none=include_none)),
     )
 
 
@@ -2548,6 +2690,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = parts[0]
     d = context.user_data
 
+    if action == "reportback":
+        await q.edit_message_text("⬅️ Возвращаемся на предыдущий шаг.")
+        await go_back_in_report(q.message, context)
+        return
+
     if action == "machine":
         items = SPECIAL_EQUIPMENT if d["category"] == "special" else DUMP_EQUIPMENT
         d["name"], d["model"], d["plate"] = items[int(parts[1])]
@@ -2568,7 +2715,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await offer_previous_special_or_continue(q.message, context)
         else:
             d["step"] = "date_manual"
-            await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:")
+            await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:", reply_markup=back_markup())
     elif action == "prevspecial":
         choice = parts[1]
 
@@ -2589,7 +2736,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await q.message.reply_text(
                 summary(d),
-                reply_markup=buttons(["Сохранить", "Отменить"], "confirm"),
+                reply_markup=with_back(buttons(["Сохранить", "Отменить"], "confirm")),
             )
         else:
             d.pop("previous_special", None)
@@ -2608,7 +2755,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             d["step"] = "start_time"
-            await q.message.reply_text("Введите время начала ЧЧ:ММ или «-»:")
+            await q.message.reply_text("Введите время начала ЧЧ:ММ или «-»:", reply_markup=back_markup())
     elif action == "driverother":
         await q.edit_message_text("Выберите водителя из общего списка.")
         await ask_ref(q.message, context, "drivers", "driver")
@@ -2826,7 +2973,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Неверное время")
             d["start"] = value
             d["step"] = "end_time"
-            await update.message.reply_text("Введите время окончания ЧЧ:ММ или «-»:")
+            await update.message.reply_text("Введите время окончания ЧЧ:ММ или «-»:", reply_markup=back_markup())
         elif step == "end_time":
             if not valid_time(value):
                 raise ValueError("Неверное время")
@@ -2845,17 +2992,17 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if d["rate"] != "-":
                 set_customer_price(d["customer"], float(d["rate"]))
             d["step"] = "note"
-            await update.message.reply_text("Введите примечание или «-»:")
+            await update.message.reply_text("Введите примечание или «-»:", reply_markup=back_markup())
         elif step == "rate_trip":
             d["rate_trip"] = number_or_dash(value)
             if d["rate_trip"] != "-":
                 set_customer_price(d["customer"], float(d["rate_trip"]))
             d["step"] = "trips"
-            await update.message.reply_text("Введите количество рейсов или «-»:")
+            await update.message.reply_text("Введите количество рейсов или «-»:", reply_markup=back_markup())
         elif step == "trips":
             d["trips"] = number_or_dash(value)
             d["step"] = "note"
-            await update.message.reply_text("Введите примечание или «-»:")
+            await update.message.reply_text("Введите примечание или «-»:", reply_markup=back_markup())
         elif step == "dump_rate":
             d["current"]["rate_trip"] = number_or_dash(value)
             if d["current"]["rate_trip"] != "-":
@@ -2865,7 +3012,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "dump",
                 )
             d["step"] = "dump_trips"
-            await update.message.reply_text("Введите количество рейсов или «-»:")
+            await update.message.reply_text("Введите количество рейсов или «-»:", reply_markup=back_markup())
         elif step == "dump_trips":
             d["current"]["trips"] = number_or_dash(value)
             d["step"] = "dump_volume"
@@ -2884,7 +3031,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await ask_ref(update.message, context, "objects", "dump_object")
             else:
                 d["step"] = "note"
-                await update.message.reply_text("Введите примечание или «-»:")
+                await update.message.reply_text("Введите примечание или «-»:", reply_markup=back_markup())
         elif step == "ref_search_query":
             kind = d["ref_kind"]
             results = search_ref_values(kind, value)
@@ -2936,7 +3083,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 d["total_trips"], d["total_volume"], d["amount"] = calc_dump(d["objects"])
             d["step"] = "confirm"
             await update.message.reply_text(
-                summary(d), reply_markup=buttons(["Сохранить", "Отменить"], "confirm")
+                summary(d), reply_markup=with_back(buttons(["Сохранить", "Отменить"], "confirm"))
             )
         elif step == "edit_value":
             special, dump, _, _ = initialize_sheets()
