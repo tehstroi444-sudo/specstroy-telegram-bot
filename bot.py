@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.5.7-back-during-report"
+BOT_VERSION = "6.5.8-repeat-previous-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1574,7 +1574,7 @@ def parse_price_value(value: Any) -> float | None:
     """Преобразует цену из Google Sheets в число.
 
     Поддерживает как сырые числа, так и отображаемые значения вида:
-    3 125,00 ₽ / 3125.00 / 3 125 ₽.
+    3 125,00 ₽ / 3125.00 / 3 125 ₽.
     """
     if value is None or value == "":
         return None
@@ -1876,6 +1876,20 @@ async def show_driver_management(message, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+def previous_report_number(value: Any) -> float | str:
+    """Безопасно читает числовое значение из старого отчёта.
+
+    Google Sheets может вернуть цену как 3500, 3 500,00 ₽ и т.п.
+    """
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    if not text or text == "-":
+        return "-"
+    parsed = parse_price_value(value)
+    return "-" if parsed is None else parsed
+
+
 def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | None:
     """Ищет последний отчёт этой техники за предыдущий календарный день."""
     try:
@@ -1901,9 +1915,9 @@ def get_previous_special_report(work_date: str, plate: str) -> dict[str, Any] | 
                 "start": padded[7].strip() or "-",
                 "end": padded[8].strip() or "-",
                 "rate_type": padded[10].strip() or "-",
-                "rate": padded[11].strip() or "-",
-                "rate_trip": padded[12].strip() or "-",
-                "trips": padded[13].strip() or "-",
+                "rate": previous_report_number(padded[11]),
+                "rate_trip": previous_report_number(padded[12]),
+                "trips": previous_report_number(padded[13]),
                 "note": padded[15].strip() if len(padded) > 15 else "",
             }
 
@@ -1971,17 +1985,22 @@ def apply_previous_special_report(d: dict[str, Any]) -> None:
     """Копирует предыдущий отчёт в текущий, оставляя выбранную новую дату."""
     previous = d["previous_special"]
 
-    d["driver"] = previous["driver"]
-    d["customer"] = previous["customer"]
-    d["object"] = previous["object"]
-    d["start"] = previous["start"]
-    d["end"] = previous["end"]
+    d["driver"] = previous.get("driver", "")
+    d["customer"] = previous.get("customer", "")
+    d["object"] = previous.get("object", "")
+    d["start"] = previous.get("start", "-") or "-"
+    d["end"] = previous.get("end", "-") or "-"
+
+    # Рабочее время всё равно будет формулой в Google Sheets,
+    # но для предпросмотра считаем его здесь.
     d["hours"] = work_hours(d["start"], d["end"])
-    d["rate_type"] = previous["rate_type"]
-    d["rate"] = previous["rate"]
-    d["rate_trip"] = previous["rate_trip"]
-    d["trips"] = previous["trips"]
-    d["note"] = previous["note"]
+
+    d["rate_type"] = previous.get("rate_type", "-") or "-"
+    d["rate"] = previous_report_number(previous.get("rate", "-"))
+    d["rate_trip"] = previous_report_number(previous.get("rate_trip", "-"))
+    d["trips"] = previous_report_number(previous.get("trips", "-"))
+    d["note"] = previous.get("note", "")
+
     d["amount"] = calc_special(d)
 
 
@@ -2720,24 +2739,45 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         choice = parts[1]
 
         if choice == "repeat":
-            previous = d.get("previous_special")
-            if not previous:
+            try:
+                previous = d.get("previous_special")
+                if not previous:
+                    await q.edit_message_text(
+                        "Предыдущий отчёт уже недоступен. Заполните сведения заново."
+                    )
+                    await ask_machine_driver(q.message, context)
+                    return
+
+                apply_previous_special_report(d)
+                d["step"] = "confirm"
+
                 await q.edit_message_text(
-                    "Предыдущий отчёт уже недоступен. Заполните сведения заново."
+                    "✅ Сведения предыдущего дня перенесены на выбранную дату."
                 )
-                await ask_machine_driver(q.message, context)
-                return
-
-            apply_previous_special_report(d)
-            d["step"] = "confirm"
-
-            await q.edit_message_text(
-                "✅ Сведения предыдущего дня перенесены на выбранную дату."
-            )
-            await q.message.reply_text(
-                summary(d),
-                reply_markup=with_back(buttons(["Сохранить", "Отменить"], "confirm")),
-            )
+                await q.message.reply_text(
+                    summary(d),
+                    reply_markup=with_back(
+                        buttons(["Сохранить", "Отменить"], "confirm")
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("Ошибка при повторении сведений предыдущего дня")
+                d["step"] = "previous_special_offer"
+                await q.edit_message_text(
+                    "❌ Не удалось повторить сведения предыдущего дня. "
+                    f"Ошибка: {type(exc).__name__}: {exc}"
+                )
+                await q.message.reply_text(
+                    "Можно заполнить отчёт заново.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[
+                            InlineKeyboardButton(
+                                "✍️ Заполнить заново",
+                                callback_data="prevspecial|new",
+                            )
+                        ]]
+                    ),
+                )
         else:
             d.pop("previous_special", None)
             await q.edit_message_text("Заполняем сведения заново.")
