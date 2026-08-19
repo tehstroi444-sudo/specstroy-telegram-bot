@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.8-remember-object-customer"
+BOT_VERSION = "6.6.9-last-object-customer-from-history"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -2789,25 +2789,98 @@ def save_last_object_customer(
         logger.exception("Не удалось сохранить последний объект/заказчика для %s", plate)
 
 
-def get_last_object_customer(plate: str) -> tuple[str, str]:
-    """Возвращает последнюю сохранённую пару объект/заказчик для машины."""
-    if not plate:
+def get_last_object_customer(
+    plate: str,
+    name: str = "",
+    model: str = "",
+) -> tuple[str, str]:
+    """Берёт последние объект и заказчика прямо из истории «Спецтехника».
+
+    Никакой отдельной служебной записи для чтения не требуется:
+    бот идёт снизу вверх по уже существующим отчётам и берёт последнюю
+    заполненную строку именно этой единицы техники.
+    """
+    if not plate and not model:
         return "", ""
 
     try:
         sp = book()
-        ws = ensure_equipment_last_pair_sheet(sp)
+        ws = sp.worksheet(SHEET_SPECIAL)
         rows = ws.get_all_values()
-        target = normalize_plate(plate)
 
-        for row in rows[1:]:
-            if row and normalize_plate(row[0]) == target:
-                padded = row + [""] * max(0, 6 - len(row))
-                return str(padded[3]).strip(), str(padded[4]).strip()
+        if len(rows) < 2:
+            return "", ""
+
+        headers = [normalize(str(v)) for v in rows[0]]
+        header_map = {h: i for i, h in enumerate(headers) if h}
+
+        def idx(*names, fallback=None):
+            for item in names:
+                key = normalize(item)
+                if key in header_map:
+                    return header_map[key]
+            return fallback
+
+        c_name = idx("Наименование техники", fallback=1)
+        c_model = idx("Модель", fallback=2)
+        c_plate = idx("Гос. номер", "Гос номер", fallback=3)
+        c_customer = idx("Заказчик", fallback=5)
+        c_object = idx("Объект", fallback=6)
+
+        def cell(row, col):
+            return str(row[col]).strip() if col is not None and col < len(row) else ""
+
+        target_plate = normalize_plate(plate)
+        target_name = normalize(name)
+        target_model = normalize(model)
+
+        # Последние отчёты находятся внизу таблицы.
+        for row_num in range(len(rows), 1, -1):
+            row = rows[row_num - 1]
+
+            row_plate = normalize_plate(cell(row, c_plate))
+            row_name = normalize(cell(row, c_name))
+            row_model = normalize(cell(row, c_model))
+
+            same_plate = bool(target_plate and row_plate and target_plate == row_plate)
+            same_name_model = bool(
+                target_name and target_model
+                and row_name == target_name
+                and row_model == target_model
+            )
+
+            if not (same_plate or same_name_model):
+                continue
+
+            last_object = cell(row, c_object)
+            last_customer = cell(row, c_customer)
+
+            # Пустую техническую строку не считаем последними сведениями.
+            if not last_object and not last_customer:
+                continue
+
+            logger.info(
+                "Найдены последние объект/заказчик: row=%s plate=%s object=%r customer=%r",
+                row_num,
+                plate,
+                last_object,
+                last_customer,
+            )
+            return last_object, last_customer
+
+        logger.info(
+            "Последние объект/заказчик не найдены: plate=%s model=%s",
+            plate,
+            model,
+        )
+        return "", ""
+
     except Exception:
-        logger.exception("Не удалось прочитать последний объект/заказчика для %s", plate)
-
-    return "", ""
+        logger.exception(
+            "Не удалось прочитать объект/заказчика из истории для %s",
+            plate,
+        )
+        return "", ""
 
 
 async def ask_special_object(message, context: ContextTypes.DEFAULT_TYPE):
@@ -3124,13 +3197,17 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
             if d.get("category") == "special":
-                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+                d["last_object"], d["last_customer"] = get_last_object_customer(
+                    d.get("plate", ""), d.get("name", ""), d.get("model", "")
+                )
             await ask_machine_driver(q.message, context)
         elif choice == "1":
             d["work_date"] = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
             if d.get("category") == "special":
-                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+                d["last_object"], d["last_customer"] = get_last_object_customer(
+                    d.get("plate", ""), d.get("name", ""), d.get("model", "")
+                )
             await ask_machine_driver(q.message, context)
         else:
             d["step"] = "date_manual"
@@ -3368,7 +3445,9 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datetime.strptime(value, "%d.%m.%Y")
             d["work_date"] = value
             if d.get("category") == "special":
-                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+                d["last_object"], d["last_customer"] = get_last_object_customer(
+                    d.get("plate", ""), d.get("name", ""), d.get("model", "")
+                )
             await ask_machine_driver(update.message, context)
         elif step == "add_machine_driver":
             ok, result = add_driver_for_plate(d["model"], d["plate"], value)
@@ -3399,6 +3478,9 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["end"] = value
             d["hours"] = work_hours(d["start"], value)
             if d["category"] == "special":
+                d["last_object"], d["last_customer"] = get_last_object_customer(
+                    d.get("plate", ""), d.get("name", ""), d.get("model", "")
+                )
                 await ask_special_object(update.message, context)
             else:
                 d["step"] = "object_count"
@@ -3610,13 +3692,6 @@ async def save_current_report(q, context):
             update_special_last_cache(special.spreadsheet, d)
         except Exception:
             logger.exception("Не удалось обновить кэш последнего отчёта")
-        save_last_object_customer(
-            d.get("plate", ""),
-            d.get("name", ""),
-            d.get("model", ""),
-            d.get("object", ""),
-            d.get("customer", ""),
-        )
         tab = SHEET_SPECIAL
     else:
         row = [
