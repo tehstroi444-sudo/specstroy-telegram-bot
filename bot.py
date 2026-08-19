@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.3-previous-info-dynamic-lookup"
+BOT_VERSION = "6.6.4-previous-cache-lastrow-links"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -43,6 +43,7 @@ SHEET_CUSTOMERS = "Заказчики"
 SHEET_CUSTOMER_REPORT = "Поиск заказчика"
 SHEET_EQUIPMENT = "Техника"
 SHEET_DRIVER_MAP = "Водители техники"
+SHEET_SPECIAL_LAST = "Последние сведения спецтехники"
 
 SPECIAL_EQUIPMENT = [
     ("Экскаватор-погрузчик", "CAT 434E №1", "3151 МК 50"),
@@ -98,6 +99,23 @@ SPECIAL_HEADERS = [
     "Пользователь Telegram",
     "Username Telegram",
     "Chat ID",
+]
+
+SPECIAL_LAST_HEADERS = [
+    "Гос. номер",
+    "Наименование техники",
+    "Модель",
+    "Дата работы",
+    "Машинист / водитель",
+    "Заказчик",
+    "Объект",
+    "Начало",
+    "Окончание",
+    "Вид ставки",
+    "Ставка, ₽",
+    "Ставка за рейс, ₽",
+    "Рейс",
+    "Примечание",
 ]
 
 DUMP_HEADERS = [
@@ -1941,6 +1959,179 @@ def parse_sheet_date(value: Any):
     return None
 
 
+def ensure_special_last_sheet(sp):
+    ws = ensure_sheet(sp, SHEET_SPECIAL_LAST, SPECIAL_LAST_HEADERS, 100)
+    try:
+        ws.hide()
+    except Exception:
+        pass
+    return ws
+
+
+def rebuild_special_last_cache_if_empty(special, cache_ws) -> None:
+    """Создаёт служебный кэш последних сведений по каждой машине."""
+    try:
+        if len(cache_ws.get_all_values()) > 1:
+            return
+
+        rows = special.get_all_values()
+        if len(rows) < 2:
+            return
+
+        headers = [normalize(str(x)) for x in rows[0]]
+        idx = {h: i for i, h in enumerate(headers) if h}
+
+        def find(*names, fallback=None):
+            for name in names:
+                key = normalize(name)
+                if key in idx:
+                    return idx[key]
+            return fallback
+
+        p = {
+            "date": find("Дата работы", fallback=0),
+            "name": find("Наименование техники", fallback=1),
+            "model": find("Модель", fallback=2),
+            "plate": find("Гос. номер", "Гос номер", fallback=3),
+            "driver": find("Машинист / водитель", "Водитель", fallback=4),
+            "customer": find("Заказчик", fallback=5),
+            "object": find("Объект", fallback=6),
+            "start": find("Начало", fallback=7),
+            "end": find("Окончание", fallback=8),
+            "rate_type": find("Вид ставки", fallback=10),
+            "rate": find("Ставка, ₽", "Ставка", fallback=11),
+            "rate_trip": find("Ставка за рейс, ₽", "Ставка за рейс", fallback=12),
+            "trips": find("Рейс", "Рейсы", fallback=13),
+            "note": find("Примечание", fallback=15),
+        }
+
+        def get(row, key):
+            i = p[key]
+            return row[i] if i is not None and i < len(row) else ""
+
+        latest = {}
+        for row_num, row in enumerate(rows[1:], start=2):
+            plate = str(get(row, "plate")).strip()
+            if not plate:
+                continue
+            date = parse_sheet_date(get(row, "date"))
+            sort_key = (date or datetime(1900, 1, 1).date(), row_num)
+            key = normalize_plate(plate)
+            if key not in latest or sort_key > latest[key][0]:
+                latest[key] = (
+                    sort_key,
+                    [
+                        plate,
+                        str(get(row, "name")).strip(),
+                        str(get(row, "model")).strip(),
+                        str(get(row, "date")).strip(),
+                        str(get(row, "driver")).strip(),
+                        str(get(row, "customer")).strip(),
+                        str(get(row, "object")).strip(),
+                        str(get(row, "start")).strip() or "-",
+                        str(get(row, "end")).strip() or "-",
+                        str(get(row, "rate_type")).strip() or "-",
+                        str(get(row, "rate")).strip() or "-",
+                        str(get(row, "rate_trip")).strip() or "-",
+                        str(get(row, "trips")).strip() or "-",
+                        str(get(row, "note")).strip(),
+                    ],
+                )
+
+        if latest:
+            values = [v[1] for v in latest.values()]
+            cache_ws.update(
+                f"A2:N{len(values)+1}",
+                values,
+                value_input_option="USER_ENTERED",
+            )
+            logger.info("Создан кэш последних сведений: %s машин", len(values))
+    except Exception:
+        logger.exception("Не удалось создать кэш последних сведений")
+
+
+def update_special_last_cache(sp, data: dict[str, Any]) -> None:
+    cache_ws = ensure_special_last_sheet(sp)
+    rows = cache_ws.get_all_values()
+    target = normalize_plate(data.get("plate", ""))
+
+    row_num = None
+    for n, row in enumerate(rows[1:], start=2):
+        if row and normalize_plate(row[0]) == target:
+            row_num = n
+            break
+    if row_num is None:
+        row_num = max(2, len(rows) + 1)
+
+    cache_ws.update(
+        f"A{row_num}:N{row_num}",
+        [[
+            data.get("plate", ""),
+            data.get("name", ""),
+            data.get("model", ""),
+            data.get("work_date", ""),
+            data.get("driver", ""),
+            data.get("customer", ""),
+            data.get("object", ""),
+            data.get("start", "-"),
+            data.get("end", "-"),
+            data.get("rate_type", "-"),
+            data.get("rate", "-"),
+            data.get("rate_trip", "-"),
+            data.get("trips", "-"),
+            data.get("note", ""),
+        ]],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def get_previous_from_cache(sp, work_date: str, plate: str) -> dict[str, Any] | None:
+    try:
+        cache_ws = ensure_special_last_sheet(sp)
+        rows = cache_ws.get_all_values()
+        selected = datetime.strptime(work_date, "%d.%m.%Y").date()
+        target = normalize_plate(plate)
+
+        for row in rows[1:]:
+            if not row or normalize_plate(row[0]) != target:
+                continue
+            padded = row + [""] * (len(SPECIAL_LAST_HEADERS) - len(row))
+            report_date = parse_sheet_date(padded[3])
+            if report_date is not None and report_date >= selected:
+                return None
+
+            return {
+                "previous_date": report_date.strftime("%d.%m.%Y") if report_date else str(padded[3]),
+                "is_yesterday": report_date == selected - timedelta(days=1) if report_date else False,
+                "driver": str(padded[4]).strip(),
+                "customer": str(padded[5]).strip(),
+                "object": str(padded[6]).strip(),
+                "start": str(padded[7]).strip() or "-",
+                "end": str(padded[8]).strip() or "-",
+                "rate_type": str(padded[9]).strip() or "-",
+                "rate": previous_report_number(padded[10]),
+                "rate_trip": previous_report_number(padded[11]),
+                "trips": previous_report_number(padded[12]),
+                "note": str(padded[13]).strip(),
+                "source_row": "cache",
+            }
+    except Exception:
+        logger.exception("Ошибка чтения кэша последних сведений")
+    return None
+
+
+def last_filled_row(ws) -> int:
+    values = ws.get_all_values()
+    for row_num in range(len(values), 1, -1):
+        if any(str(v).strip() for v in values[row_num - 1]):
+            return row_num
+    return 2
+
+
+def sheet_row_url(sp, ws, row_num: int) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sp.id}/edit#gid={ws.id}&range=A{row_num}"
+
+
 def get_previous_special_report(
     work_date: str,
     plate: str,
@@ -1960,7 +2151,9 @@ def get_previous_special_report(
         rows = special.get_all_values()
 
         if len(rows) < 2:
-            return None
+            cache_ws = ensure_special_last_sheet(special.spreadsheet)
+            rebuild_special_last_cache_if_empty(special, cache_ws)
+            return get_previous_from_cache(special.spreadsheet, work_date, plate)
 
         headers = [normalize(str(x)) for x in rows[0]]
         header_index = {name: i for i, name in enumerate(headers) if name}
@@ -2025,10 +2218,12 @@ def get_previous_special_report(
         candidates = exact_plate if exact_plate else fallback_matches
         if not candidates:
             logger.info(
-                "Нет предыдущих записей: plate=%r model=%r name=%r, rows=%s",
+                "Нет предыдущих записей в основной таблице: plate=%r model=%r name=%r, rows=%s",
                 plate, model, equipment_name, len(rows) - 1,
             )
-            return None
+            cache_ws = ensure_special_last_sheet(special.spreadsheet)
+            rebuild_special_last_cache_if_empty(special, cache_ws)
+            return get_previous_from_cache(special.spreadsheet, work_date, plate)
 
         # Сначала строго вчера; если вчера записи нет — последний более ранний отчёт.
         yesterday_candidates = [x for x in candidates if x[0] == yesterday]
@@ -2631,6 +2826,35 @@ async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             f"❌ Не удалось восстановить фильтры: {type(exc).__name__}: {exc}",
             reply_markup=menu(),
+        )
+
+
+async def lastrows_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        special, dump, _, _ = initialize_sheets()
+        sp = special.spreadsheet
+        s_row = last_filled_row(special)
+        d_row = last_filled_row(dump)
+
+        await update.effective_message.reply_text(
+            "Открыть таблицу на последней заполненной строке:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(
+                        f"🚜 Спецтехника — строка {s_row}",
+                        url=sheet_row_url(sp, special, s_row),
+                    )],
+                    [InlineKeyboardButton(
+                        f"🚛 Самосвалы — строка {d_row}",
+                        url=sheet_row_url(sp, dump, d_row),
+                    )],
+                ]
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Ошибка перехода к последним строкам")
+        await update.effective_message.reply_text(
+            f"❌ Не удалось получить последние строки: {type(exc).__name__}: {exc}"
         )
 
 
@@ -3416,6 +3640,10 @@ async def save_current_report(q, context):
         row_num = save_row(special, row)
         special.update_cell(row_num, 10, special_hours_formula(row_num))
         special.update_cell(row_num, 15, special_amount_formula(row_num))
+        try:
+            update_special_last_cache(special.spreadsheet, d)
+        except Exception:
+            logger.exception("Не удалось обновить кэш последнего отчёта")
         tab = SHEET_SPECIAL
     else:
         row = [
@@ -3458,7 +3686,14 @@ async def save_current_report(q, context):
         for col, formula in formulas.items():
             dump.update_cell(row_num, col, formula)
         tab = SHEET_DUMP
-    await q.edit_message_text(f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}")
+    ws = special if d["category"] == "special" else dump
+    row_link = sheet_row_url(ws.spreadsheet, ws, row_num)
+    await q.edit_message_text(
+        f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📍 Открыть последнюю строку", url=row_link)]]
+        ),
+    )
     await q.message.reply_text("Выберите действие:", reply_markup=menu())
     context.user_data.clear()
 
@@ -3611,6 +3846,7 @@ def build():
     app.add_handler(CommandHandler("new", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("version", version))
+    app.add_handler(CommandHandler("lastrows", lastrows_command))
     app.add_handler(CommandHandler("filters", filters_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("syncdocs", sync_documents_command))
