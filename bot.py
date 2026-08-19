@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.5-repeat-previous-rebuilt"
+BOT_VERSION = "6.6.6-repeat-button-fixed"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1612,7 +1612,7 @@ def parse_price_value(value: Any) -> float | None:
     """Преобразует цену из Google Sheets в число.
 
     Поддерживает как сырые числа, так и отображаемые значения вида:
-    3 125,00 ₽ / 3125.00 / 3 125 ₽.
+    3 125,00 ₽ / 3125.00 / 3 125 ₽.
     """
     if value is None or value == "":
         return None
@@ -2226,10 +2226,16 @@ def get_previous_special_report(
 
         if not matches:
             logger.info(
-                "Предыдущая информация не найдена: plate=%r model=%r name=%r",
+                "Предыдущая информация в основной таблице не найдена: plate=%r model=%r name=%r",
                 plate, model, equipment_name,
             )
-            return None
+            try:
+                cache_ws = ensure_special_last_sheet(sp)
+                rebuild_special_last_cache_if_empty(special, cache_ws)
+                return get_previous_from_cache(sp, work_date, plate)
+            except Exception:
+                logger.exception("Не удалось выполнить резервный поиск по кэшу")
+                return None
 
         # 1. Строго предыдущий день.
         yesterday_matches = [x for x in matches if x[2] == yesterday]
@@ -2286,7 +2292,25 @@ def get_previous_special_report(
             "Ошибка прямого поиска предыдущего отчёта: date=%s plate=%s model=%s",
             work_date, plate, model,
         )
-        return None
+
+    # Резервный поиск в служебном кэше.
+    try:
+        sp = book()
+        special = sp.worksheet(SHEET_SPECIAL)
+        cache_ws = ensure_special_last_sheet(sp)
+        rebuild_special_last_cache_if_empty(special, cache_ws)
+        cached = get_previous_from_cache(sp, work_date, plate)
+        if cached:
+            logger.info(
+                "Предыдущая информация взята из кэша: plate=%s date=%s",
+                plate,
+                cached.get("previous_date"),
+            )
+            return cached
+    except Exception:
+        logger.exception("Ошибка резервного поиска предыдущих сведений")
+
+    return None
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
@@ -3129,42 +3153,91 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if choice == "repeat":
             try:
-                previous = d.get("previous_special")
-                if not previous:
-                    await q.answer(
-                        "Предыдущие сведения по этой машине пока не найдены.",
-                        show_alert=True,
+                # Каждый клик заново читает Google Sheets.
+                # Поэтому кнопка работает даже если user_data потерял старый результат поиска.
+                previous = get_previous_special_report(
+                    d.get("work_date", ""),
+                    d.get("plate", ""),
+                    d.get("model", ""),
+                    d.get("name", ""),
+                )
+
+                if previous is None:
+                    d["previous_special"] = None
+                    d["step"] = "previous_special_offer"
+                    await q.edit_message_text(
+                        "❌ Предыдущие сведения по этой машине не удалось найти.\n\n"
+                        f"Техника: {d.get('model', '—')}\n"
+                        f"Гос. номер: {d.get('plate', '—')}\n"
+                        f"Дата нового отчёта: {d.get('work_date', '—')}\n\n"
+                        "Выберите «Заполнить новые сведения» или вернитесь к дате.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "✍️ Заполнить новые сведения",
+                                        callback_data="prevspecial|new",
+                                    )
+                                ],
+                                [
+                                    InlineKeyboardButton(
+                                        "⬅️ Назад к дате",
+                                        callback_data="reportback|0",
+                                    )
+                                ],
+                            ]
+                        ),
                     )
                     return
 
+                d["previous_special"] = previous
                 apply_previous_special_report(d)
                 d["step"] = "confirm"
 
-                await q.edit_message_text(
-                    "✅ Сведения за предыдущий день перенесены на выбранную дату."
+                loaded_text = (
+                    "✅ Предыдущие сведения загружены.\n\n"
+                    f"Источник: {previous.get('previous_date', 'предыдущий отчёт')}\n"
+                    f"Водитель: {d.get('driver') or '—'}\n"
+                    f"Заказчик: {d.get('customer') or '—'}\n"
+                    f"Объект: {d.get('object') or '—'}\n"
+                    f"Начало: {d.get('start', '—')}\n"
+                    f"Окончание: {d.get('end', '—')}\n"
+                    f"Вид ставки: {d.get('rate_type', '—')}\n"
+                    f"Ставка: {d.get('rate', '—')}\n"
+                    f"Ставка за рейс: {d.get('rate_trip', '—')}\n"
+                    f"Рейс: {d.get('trips', '—')}\n\n"
+                    "Проверьте сведения перед сохранением."
                 )
+
+                await q.edit_message_text(loaded_text)
                 await q.message.reply_text(
                     summary(d),
                     reply_markup=with_back(
                         buttons(["Сохранить", "Отменить"], "confirm")
                     ),
                 )
+
             except Exception as exc:
-                logger.exception("Ошибка при повторении сведений предыдущего дня")
+                logger.exception("Ошибка кнопки повторения предыдущих сведений")
                 d["step"] = "previous_special_offer"
                 await q.edit_message_text(
-                    "❌ Не удалось повторить сведения предыдущего дня. "
-                    f"Ошибка: {type(exc).__name__}: {exc}"
-                )
-                await q.message.reply_text(
-                    "Можно заполнить отчёт заново.",
+                    "❌ При загрузке предыдущих сведений произошла ошибка.\n"
+                    f"{type(exc).__name__}: {exc}",
                     reply_markup=InlineKeyboardMarkup(
-                        [[
-                            InlineKeyboardButton(
-                                "✍️ Заполнить заново",
-                                callback_data="prevspecial|new",
-                            )
-                        ]]
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✍️ Заполнить новые сведения",
+                                    callback_data="prevspecial|new",
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "⬅️ Назад к дате",
+                                    callback_data="reportback|0",
+                                )
+                            ],
+                        ]
                     ),
                 )
         else:
