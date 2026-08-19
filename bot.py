@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.6-repeat-button-fixed"
+BOT_VERSION = "6.6.7-repeat-history-by-equipment"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -2138,183 +2138,126 @@ def get_previous_special_report(
     model: str = "",
     equipment_name: str = "",
 ) -> dict[str, Any] | None:
-    """Находит предыдущий отчёт выбранной единицы Спецтехники.
+    """Возвращает последний более ранний отчёт именно этой единицы техники.
 
-    ВАЖНО: функция не вызывает initialize_sheets(), поэтому поиск не зависит
-    от оформления листа, фильтров, формул и лимитов лишних Write-запросов.
+    Ищем по истории листа «Спецтехника» снизу вверх. Это соответствует тому,
+    как бот сохраняет отчёты: новые строки добавляются вниз.
 
-    Приоритет:
-    1) эта же машина за предыдущий календарный день;
-    2) последний более ранний отчёт этой же машины.
+    Госномер сравнивается в нормализованном виде. Если номер в старой строке
+    записан иначе/пуст, используется точная пара «наименование + модель».
     """
     try:
         selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
-        yesterday = selected_date - timedelta(days=1)
-
         sp = book()
-        special = sp.worksheet(SHEET_SPECIAL)
-        rows = special.get_all_values()
+        ws = sp.worksheet(SHEET_SPECIAL)
 
+        # Получаем отображаемые значения ровно так, как пользователь видит их
+        # в Google Sheets. Для старых строк это надёжнее формул/типов.
+        rows = ws.get_all_values()
         if len(rows) < 2:
             return None
 
-        # Индексы ищем по реальным названиям колонок.
-        headers = [normalize(str(x)) for x in rows[0]]
-        idx = {h: i for i, h in enumerate(headers) if h}
+        headers = [normalize(str(v)) for v in rows[0]]
+        header_map = {h: i for i, h in enumerate(headers) if h}
 
-        def find_col(*names, fallback=None):
+        def idx(*names, fallback=None):
             for name in names:
                 key = normalize(name)
-                if key in idx:
-                    return idx[key]
+                if key in header_map:
+                    return header_map[key]
             return fallback
 
-        columns = {
-            "date": find_col("Дата работы", fallback=0),
-            "name": find_col("Наименование техники", fallback=1),
-            "model": find_col("Модель", fallback=2),
-            "plate": find_col("Гос. номер", "Гос номер", fallback=3),
-            "driver": find_col("Машинист / водитель", "Водитель", fallback=4),
-            "customer": find_col("Заказчик", fallback=5),
-            "object": find_col("Объект", fallback=6),
-            "start": find_col("Начало", fallback=7),
-            "end": find_col("Окончание", fallback=8),
-            "rate_type": find_col("Вид ставки", fallback=10),
-            "rate": find_col("Ставка, ₽", "Ставка", fallback=11),
-            "rate_trip": find_col("Ставка за рейс, ₽", "Ставка за рейс", fallback=12),
-            "trips": find_col("Рейс", "Рейсы", fallback=13),
-            "note": find_col("Примечание", fallback=15),
-        }
+        c_date = idx("Дата работы", fallback=0)
+        c_name = idx("Наименование техники", fallback=1)
+        c_model = idx("Модель", fallback=2)
+        c_plate = idx("Гос. номер", "Гос номер", fallback=3)
+        c_driver = idx("Машинист / водитель", "Водитель", fallback=4)
+        c_customer = idx("Заказчик", fallback=5)
+        c_object = idx("Объект", fallback=6)
+        c_start = idx("Начало", fallback=7)
+        c_end = idx("Окончание", fallback=8)
+        c_rate_type = idx("Вид ставки", fallback=10)
+        c_rate = idx("Ставка, ₽", "Ставка", fallback=11)
+        c_rate_trip = idx("Ставка за рейс, ₽", "Ставка за рейс", fallback=12)
+        c_trips = idx("Рейс", "Рейсы", fallback=13)
+        c_note = idx("Примечание", fallback=15)
 
-        def get(row, key):
-            i = columns[key]
-            return row[i] if i is not None and i < len(row) else ""
+        def cell(row, col):
+            return str(row[col]).strip() if col is not None and col < len(row) else ""
 
         target_plate = normalize_plate(plate)
-        target_model = normalize(model)
         target_name = normalize(equipment_name)
+        target_model = normalize(model)
 
-        matches = []
+        # Снизу вверх = последний сохранённый отчёт первым.
+        for row_num in range(len(rows), 1, -1):
+            row = rows[row_num - 1]
 
-        # Идём по всем строкам, но не требуем идеального формата даты для
-        # определения самой машины.
-        for row_num, row in enumerate(rows[1:], start=2):
-            row_plate = str(get(row, "plate")).strip()
-            row_model = str(get(row, "model")).strip()
-            row_name = str(get(row, "name")).strip()
+            old_plate = normalize_plate(cell(row, c_plate))
+            old_name = normalize(cell(row, c_name))
+            old_model = normalize(cell(row, c_model))
 
-            same_plate = bool(target_plate) and normalize_plate(row_plate) == target_plate
-            same_model = bool(target_model) and normalize(row_model) == target_model
-            same_name_model = (
-                bool(target_name)
-                and bool(target_model)
-                and normalize(row_name) == target_name
-                and normalize(row_model) == target_model
+            same_plate = bool(target_plate and old_plate and old_plate == target_plate)
+            same_equipment = bool(
+                target_name and target_model
+                and old_name == target_name
+                and old_model == target_model
             )
 
-            if not (same_plate or same_model or same_name_model):
+            if not (same_plate or same_equipment):
                 continue
 
-            row_date = parse_sheet_date(get(row, "date"))
-
-            # Не берём текущую/будущую запись, если дата распознана.
-            if row_date is not None and row_date >= selected_date:
+            old_date = parse_sheet_date(cell(row, c_date))
+            # Нам нужна только запись ДО выбранной даты.
+            if old_date is not None and old_date >= selected_date:
                 continue
 
-            # Совпадение по номеру имеет больший вес.
-            matches.append((row_num, row, row_date, same_plate))
+            previous_date = (
+                old_date.strftime("%d.%m.%Y")
+                if old_date is not None
+                else cell(row, c_date) or "предыдущая запись"
+            )
 
-        if not matches:
             logger.info(
-                "Предыдущая информация в основной таблице не найдена: plate=%r model=%r name=%r",
-                plate, model, equipment_name,
+                "REPEAT FOUND row=%s selected=%s plate=%r old_plate=%r model=%r",
+                row_num, work_date, plate, cell(row, c_plate), model,
             )
-            try:
-                cache_ws = ensure_special_last_sheet(sp)
-                rebuild_special_last_cache_if_empty(special, cache_ws)
-                return get_previous_from_cache(sp, work_date, plate)
-            except Exception:
-                logger.exception("Не удалось выполнить резервный поиск по кэшу")
-                return None
 
-        # 1. Строго предыдущий день.
-        yesterday_matches = [x for x in matches if x[2] == yesterday]
-        if yesterday_matches:
-            row_num, row, row_date, _ = max(
-                yesterday_matches,
-                key=lambda x: (x[3], x[0]),
-            )
-            is_yesterday = True
-        else:
-            # 2. Если вчера записи нет, берём последнюю более раннюю.
-            # Если дата старой строки не распознана, считаем номер строки:
-            # отчёты добавляются вниз, поэтому нижняя строка новее.
-            dated = [x for x in matches if x[2] is not None]
-            if dated:
-                row_num, row, row_date, _ = max(
-                    dated,
-                    key=lambda x: (x[2], x[3], x[0]),
-                )
-            else:
-                row_num, row, row_date, _ = max(matches, key=lambda x: (x[3], x[0]))
-            is_yesterday = False
+            return {
+                "previous_date": previous_date,
+                "is_yesterday": (
+                    old_date == selected_date - timedelta(days=1)
+                    if old_date is not None else False
+                ),
+                "driver": cell(row, c_driver),
+                "customer": cell(row, c_customer),
+                "object": cell(row, c_object),
+                "start": cell(row, c_start) or "-",
+                "end": cell(row, c_end) or "-",
+                "rate_type": cell(row, c_rate_type) or "-",
+                "rate": previous_report_number(cell(row, c_rate)),
+                "rate_trip": previous_report_number(cell(row, c_rate_trip)),
+                "trips": previous_report_number(cell(row, c_trips)),
+                "note": cell(row, c_note),
+                "source_row": row_num,
+            }
 
-        previous_date = (
-            row_date.strftime("%d.%m.%Y")
-            if row_date is not None
-            else str(get(row, "date")).strip() or "предыдущая запись"
+        logger.warning(
+            "REPEAT NOT FOUND selected=%s plate=%r normalized=%r name=%r model=%r rows=%s",
+            work_date, plate, target_plate, equipment_name, model, len(rows)-1,
         )
-
-        result = {
-            "previous_date": previous_date,
-            "is_yesterday": is_yesterday,
-            "driver": str(get(row, "driver")).strip(),
-            "customer": str(get(row, "customer")).strip(),
-            "object": str(get(row, "object")).strip(),
-            "start": str(get(row, "start")).strip() or "-",
-            "end": str(get(row, "end")).strip() or "-",
-            "rate_type": str(get(row, "rate_type")).strip() or "-",
-            "rate": previous_report_number(get(row, "rate")),
-            "rate_trip": previous_report_number(get(row, "rate_trip")),
-            "trips": previous_report_number(get(row, "trips")),
-            "note": str(get(row, "note")).strip(),
-            "source_row": row_num,
-        }
-
-        logger.info(
-            "Предыдущая информация найдена: plate=%s row=%s date=%s",
-            plate, row_num, previous_date,
-        )
-        return result
+        return None
 
     except Exception:
         logger.exception(
-            "Ошибка прямого поиска предыдущего отчёта: date=%s plate=%s model=%s",
+            "REPEAT LOOKUP ERROR selected=%s plate=%r model=%r",
             work_date, plate, model,
         )
-
-    # Резервный поиск в служебном кэше.
-    try:
-        sp = book()
-        special = sp.worksheet(SHEET_SPECIAL)
-        cache_ws = ensure_special_last_sheet(sp)
-        rebuild_special_last_cache_if_empty(special, cache_ws)
-        cached = get_previous_from_cache(sp, work_date, plate)
-        if cached:
-            logger.info(
-                "Предыдущая информация взята из кэша: plate=%s date=%s",
-                plate,
-                cached.get("previous_date"),
-            )
-            return cached
-    except Exception:
-        logger.exception("Ошибка резервного поиска предыдущих сведений")
-
-    return None
+        return None
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """После техники и даты всегда предлагает повторить сведения или заполнить новые."""
+    """После выбора техники и даты предлагает повтор предыдущего отчёта."""
     d = context.user_data
 
     if d.get("category") != "special":
@@ -2327,65 +2270,60 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
         d.get("model", ""),
         d.get("name", ""),
     )
-
     d["previous_special"] = previous
     d["step"] = "previous_special_offer"
 
     machine_title = f"{d.get('model', '')} — {d.get('plate', '')}".strip(" —")
 
     if previous:
-        if previous.get("is_yesterday"):
-            info_line = f"Найдены сведения за предыдущий день: {previous['previous_date']}."
-        else:
-            info_line = f"Найдены последние предыдущие сведения: {previous['previous_date']}."
-
         text = (
             f"{machine_title}\n"
             f"Дата отчёта: {d['work_date']}\n\n"
-            f"{info_line}\n\n"
+            f"Найден предыдущий отчёт за {previous['previous_date']}.\n\n"
             f"Водитель: {previous['driver'] or '—'}\n"
             f"Заказчик: {previous['customer'] or '—'}\n"
             f"Объект: {previous['object'] or '—'}\n"
-            f"Время: {previous['start']}–{previous['end']}\n"
+            f"Начало: {previous['start']}\n"
+            f"Окончание: {previous['end']}\n"
             f"Вид ставки: {previous['rate_type']}\n"
             f"Ставка: {previous['rate']}\n"
             f"Ставка за рейс: {previous['rate_trip']}\n"
             f"Рейс: {previous['trips']}\n\n"
-            "Выберите действие:"
+            "Повторить эти сведения?"
         )
+        rows = [
+            [InlineKeyboardButton(
+                f"🔁 Повторить сведения за {previous['previous_date']}",
+                callback_data="prevspecial|repeat",
+            )],
+            [InlineKeyboardButton(
+                "✍️ Заполнить новые сведения",
+                callback_data="prevspecial|new",
+            )],
+            [InlineKeyboardButton(
+                "⬅️ Назад к дате",
+                callback_data="reportback|0",
+            )],
+        ]
     else:
         text = (
             f"{machine_title}\n"
             f"Дата отчёта: {d['work_date']}\n\n"
-            "Сохранённые предыдущие сведения по этой машине не найдены.\n\n"
-            "Выберите действие:"
+            "Более раннего отчёта по этой единице техники в листе "
+            "«Спецтехника» не найдено."
         )
-
-    # Кнопка повторения присутствует ВСЕГДА.
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔁 Повторить предыдущие сведения",
-                    callback_data="prevspecial|repeat",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✍️ Заполнить новые сведения",
-                    callback_data="prevspecial|new",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад к дате",
-                    callback_data="reportback|0",
-                )
-            ],
+        rows = [
+            [InlineKeyboardButton(
+                "✍️ Заполнить новые сведения",
+                callback_data="prevspecial|new",
+            )],
+            [InlineKeyboardButton(
+                "⬅️ Назад к дате",
+                callback_data="reportback|0",
+            )],
         ]
-    )
 
-    await message.reply_text(text, reply_markup=keyboard)
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 def apply_previous_special_report(d: dict[str, Any]) -> None:
@@ -3153,14 +3091,16 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if choice == "repeat":
             try:
-                # Каждый клик заново читает Google Sheets.
-                # Поэтому кнопка работает даже если user_data потерял старый результат поиска.
-                previous = get_previous_special_report(
-                    d.get("work_date", ""),
-                    d.get("plate", ""),
-                    d.get("model", ""),
-                    d.get("name", ""),
-                )
+                # Основной результат уже найден сразу после выбора даты.
+                # Если Telegram-контекст по какой-то причине потерян — читаем историю ещё раз.
+                previous = d.get("previous_special")
+                if previous is None:
+                    previous = get_previous_special_report(
+                        d.get("work_date", ""),
+                        d.get("plate", ""),
+                        d.get("model", ""),
+                        d.get("name", ""),
+                    )
 
                 if previous is None:
                     d["previous_special"] = None
