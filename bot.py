@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.2-previous-info-reliable"
+BOT_VERSION = "6.6.3-previous-info-dynamic-lookup"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -1594,7 +1594,7 @@ def parse_price_value(value: Any) -> float | None:
     """Преобразует цену из Google Sheets в число.
 
     Поддерживает как сырые числа, так и отображаемые значения вида:
-    3 125,00 ₽ / 3125.00 / 3 125 ₽.
+    3 125,00 ₽ / 3125.00 / 3 125 ₽.
     """
     if value is None or value == "":
         return None
@@ -1911,7 +1911,7 @@ def previous_report_number(value: Any) -> float | str:
 
 
 def parse_sheet_date(value: Any):
-    """Преобразует дату из Google Sheets в date, поддерживая разные отображения."""
+    """Надёжно преобразует дату из Google Sheets в date."""
     if value is None:
         return None
 
@@ -1919,9 +1919,10 @@ def parse_sheet_date(value: Any):
     if not text:
         return None
 
-    m = re.search(r"(\\d{1,2}[./]\\d{1,2}[./]\\d{2,4})", text)
-    if m:
-        text = m.group(1)
+    # Дата может прийти вместе со временем.
+    match = re.search(r"(\d{1,2}[./]\d{1,2}[./]\d{2,4})", text)
+    if match:
+        text = match.group(1)
 
     for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
         try:
@@ -1929,6 +1930,7 @@ def parse_sheet_date(value: Any):
         except ValueError:
             pass
 
+    # Google Sheets serial date.
     try:
         serial = float(str(value).replace(",", "."))
         if serial > 1000:
@@ -1945,93 +1947,129 @@ def get_previous_special_report(
     model: str = "",
     equipment_name: str = "",
 ) -> dict[str, Any] | None:
-    """Ищет предыдущие сведения по выбранной единице техники.
+    """Ищет предыдущие сведения по технике во вкладке Спецтехника.
 
-    Сначала ищет вчерашний отчёт. Если его нет, берёт последний более ранний
-    отчёт этой же машины. Основной ключ — госномер, резервный — модель.
+    Использует названия колонок из первой строки, а не жёсткие номера столбцов.
+    Поэтому поиск продолжает работать после перестановок/изменений структуры таблицы.
     """
     try:
         selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
         yesterday = selected_date - timedelta(days=1)
 
         special, _, _, _ = initialize_sheets()
+        rows = special.get_all_values()
 
-        try:
-            rows = special.get_all_values(value_render_option="FORMATTED_VALUE")
-        except TypeError:
-            rows = special.get_all_values()
+        if len(rows) < 2:
+            return None
 
-        plate_key = normalize_plate(plate)
-        model_key = normalize(model)
-        name_key = normalize(equipment_name)
+        headers = [normalize(str(x)) for x in rows[0]]
+        header_index = {name: i for i, name in enumerate(headers) if name}
 
-        candidates = []
+        def col(*names, fallback=None):
+            for name in names:
+                key = normalize(name)
+                if key in header_index:
+                    return header_index[key]
+            return fallback
 
-        for row_index, row in enumerate(rows[1:], start=2):
-            padded = row + [""] * max(0, len(SPECIAL_HEADERS) - len(row))
+        idx_date = col("Дата работы", fallback=0)
+        idx_name = col("Наименование техники", fallback=1)
+        idx_model = col("Модель", fallback=2)
+        idx_plate = col("Гос. номер", "Гос номер", fallback=3)
+        idx_driver = col("Машинист / водитель", "Водитель", fallback=4)
+        idx_customer = col("Заказчик", fallback=5)
+        idx_object = col("Объект", fallback=6)
+        idx_start = col("Начало", fallback=7)
+        idx_end = col("Окончание", fallback=8)
+        idx_rate_type = col("Вид ставки", fallback=10)
+        idx_rate = col("Ставка, ₽", "Ставка", fallback=11)
+        idx_rate_trip = col("Ставка за рейс, ₽", "Ставка за рейс", fallback=12)
+        idx_trips = col("Рейс", "Рейсы", fallback=13)
+        idx_note = col("Примечание", fallback=15)
 
-            row_date = parse_sheet_date(padded[0])
+        def get(row, idx):
+            return row[idx] if idx is not None and idx < len(row) else ""
+
+        target_plate = normalize_plate(plate)
+        target_model = normalize(model)
+        target_name = normalize(equipment_name)
+
+        exact_plate = []
+        fallback_matches = []
+
+        for row_num, row in enumerate(rows[1:], start=2):
+            row_date = parse_sheet_date(get(row, idx_date))
             if row_date is None or row_date >= selected_date:
                 continue
 
-            row_name = str(padded[1]).strip()
-            row_model = str(padded[2]).strip()
-            row_plate = str(padded[3]).strip()
+            row_plate = str(get(row, idx_plate)).strip()
+            row_model = str(get(row, idx_model)).strip()
+            row_name = str(get(row, idx_name)).strip()
 
-            same_plate = bool(plate_key) and normalize_plate(row_plate) == plate_key
-            same_model = bool(model_key) and normalize(row_model) == model_key
-            same_name_model = (
-                bool(name_key)
-                and bool(model_key)
-                and normalize(row_name) == name_key
-                and normalize(row_model) == model_key
+            plate_match = bool(target_plate) and normalize_plate(row_plate) == target_plate
+            model_match = bool(target_model) and normalize(row_model) == target_model
+            name_model_match = (
+                bool(target_name)
+                and bool(target_model)
+                and normalize(row_name) == target_name
+                and normalize(row_model) == target_model
             )
 
-            if not (same_plate or same_model or same_name_model):
-                continue
+            item = (row_date, row_num, row)
 
-            candidates.append((row_date, row_index, padded, same_plate))
+            if plate_match:
+                exact_plate.append(item)
+            elif model_match or name_model_match:
+                fallback_matches.append(item)
 
+        candidates = exact_plate if exact_plate else fallback_matches
         if not candidates:
             logger.info(
-                "Предыдущие сведения не найдены: дата=%s, госномер=%s, модель=%s",
-                work_date, plate, model,
+                "Нет предыдущих записей: plate=%r model=%r name=%r, rows=%s",
+                plate, model, equipment_name, len(rows) - 1,
             )
             return None
 
-        yesterday_rows = [x for x in candidates if x[0] == yesterday]
-        if yesterday_rows:
-            yesterday_rows.sort(key=lambda x: (x[3], x[1]))
-            report_date, _, padded, _ = yesterday_rows[-1]
+        # Сначала строго вчера; если вчера записи нет — последний более ранний отчёт.
+        yesterday_candidates = [x for x in candidates if x[0] == yesterday]
+        if yesterday_candidates:
+            report_date, row_num, row = max(yesterday_candidates, key=lambda x: x[1])
+            is_yesterday = True
         else:
-            candidates.sort(key=lambda x: (x[0], x[3], x[1]))
-            report_date, _, padded, _ = candidates[-1]
+            report_date, row_num, row = max(candidates, key=lambda x: (x[0], x[1]))
+            is_yesterday = False
+
+        logger.info(
+            "Найден предыдущий отчёт: row=%s date=%s plate=%r model=%r",
+            row_num, report_date, get(row, idx_plate), get(row, idx_model),
+        )
 
         return {
             "previous_date": report_date.strftime("%d.%m.%Y"),
-            "is_yesterday": report_date == yesterday,
-            "driver": str(padded[4]).strip(),
-            "customer": str(padded[5]).strip(),
-            "object": str(padded[6]).strip(),
-            "start": str(padded[7]).strip() or "-",
-            "end": str(padded[8]).strip() or "-",
-            "rate_type": str(padded[10]).strip() or "-",
-            "rate": previous_report_number(padded[11]),
-            "rate_trip": previous_report_number(padded[12]),
-            "trips": previous_report_number(padded[13]),
-            "note": str(padded[15]).strip() if len(padded) > 15 else "",
+            "is_yesterday": is_yesterday,
+            "driver": str(get(row, idx_driver)).strip(),
+            "customer": str(get(row, idx_customer)).strip(),
+            "object": str(get(row, idx_object)).strip(),
+            "start": str(get(row, idx_start)).strip() or "-",
+            "end": str(get(row, idx_end)).strip() or "-",
+            "rate_type": str(get(row, idx_rate_type)).strip() or "-",
+            "rate": previous_report_number(get(row, idx_rate)),
+            "rate_trip": previous_report_number(get(row, idx_rate_trip)),
+            "trips": previous_report_number(get(row, idx_trips)),
+            "note": str(get(row, idx_note)).strip(),
+            "source_row": row_num,
         }
 
     except Exception:
         logger.exception(
-            "Ошибка поиска предыдущих сведений: дата=%s, госномер=%s, модель=%s",
+            "Ошибка поиска предыдущих сведений: date=%s plate=%s model=%s",
             work_date, plate, model,
         )
         return None
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """После выбора техники и даты предлагает предыдущие сведения или новые."""
+    """После выбора техники и даты предлагает прошлые сведения или новое заполнение."""
     d = context.user_data
 
     if d.get("category") != "special":
@@ -2044,6 +2082,7 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
         d.get("model", ""),
         d.get("name", ""),
     )
+
     d["previous_special"] = previous
     d["step"] = "previous_special_offer"
 
@@ -2051,72 +2090,75 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
 
     if previous:
         if previous.get("is_yesterday"):
-            found_line = f"Нашёл сведения за предыдущий день — {previous['previous_date']}:"
+            found_line = f"Сведения за предыдущий день ({previous['previous_date']}) найдены."
         else:
             found_line = (
                 f"За предыдущий день записи нет. "
-                f"Нашёл последние сведения — {previous['previous_date']}:"
+                f"Найдены последние сведения за {previous['previous_date']}."
             )
 
         text = (
-            f"{machine_title}\\n"
-            f"Дата отчёта: {d['work_date']}\\n\\n"
-            f"{found_line}\\n"
-            f"Водитель: {previous['driver'] or '—'}\\n"
-            f"Заказчик: {previous['customer'] or '—'}\\n"
-            f"Объект: {previous['object'] or '—'}\\n"
-            f"Время: {previous['start']}–{previous['end']}\\n"
-            f"Вид ставки: {previous['rate_type']}\\n"
-            f"Ставка: {previous['rate']}\\n"
-            f"Ставка за рейс: {previous['rate_trip']}\\n"
-            f"Рейс: {previous['trips']}\\n\\n"
+            f"{machine_title}\n"
+            f"Дата отчёта: {d['work_date']}\n\n"
+            f"{found_line}\n\n"
+            f"Водитель: {previous['driver'] or '—'}\n"
+            f"Заказчик: {previous['customer'] or '—'}\n"
+            f"Объект: {previous['object'] or '—'}\n"
+            f"Время: {previous['start']}–{previous['end']}\n"
+            f"Вид ставки: {previous['rate_type']}\n"
+            f"Ставка: {previous['rate']}\n"
+            f"Ставка за рейс: {previous['rate_trip']}\n"
+            f"Рейс: {previous['trips']}\n\n"
             "Как заполнить отчёт?"
         )
-        rows = [
+
+        keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    f"🔁 Взять сведения за {previous['previous_date']}",
-                    callback_data="prevspecial|repeat",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✍️ Заполнить новые сведения",
-                    callback_data="prevspecial|new",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад к дате",
-                    callback_data="reportback|0",
-                )
-            ],
-        ]
+                [
+                    InlineKeyboardButton(
+                        f"🔁 Взять сведения за {previous['previous_date']}",
+                        callback_data="prevspecial|repeat",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✍️ Заполнить новые сведения",
+                        callback_data="prevspecial|new",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад к дате",
+                        callback_data="reportback|0",
+                    )
+                ],
+            ]
+        )
     else:
         text = (
-            f"{machine_title}\\n"
-            f"Дата отчёта: {d['work_date']}\\n\\n"
-            "Предыдущих сведений по этой технике не найдено.\\n"
-            f"Проверено по госномеру {d.get('plate', '—')} "
-            f"и модели {d.get('model', '—')}.\\n\\n"
-            "Можно заполнить новые сведения."
+            f"{machine_title}\n"
+            f"Дата отчёта: {d['work_date']}\n\n"
+            "Предыдущие сведения по этой технике в таблице не найдены.\n\n"
+            "Заполните новые сведения."
         )
-        rows = [
+        keyboard = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton(
-                    "✍️ Заполнить новые сведения",
-                    callback_data="prevspecial|new",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Назад к дате",
-                    callback_data="reportback|0",
-                )
-            ],
-        ]
+                [
+                    InlineKeyboardButton(
+                        "✍️ Заполнить новые сведения",
+                        callback_data="prevspecial|new",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад к дате",
+                        callback_data="reportback|0",
+                    )
+                ],
+            ]
+        )
 
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    await message.reply_text(text, reply_markup=keyboard)
 
 
 def apply_previous_special_report(d: dict[str, Any]) -> None:
