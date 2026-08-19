@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.7-repeat-history-by-equipment"
+BOT_VERSION = "6.6.8-remember-object-customer"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -44,6 +44,7 @@ SHEET_CUSTOMER_REPORT = "Поиск заказчика"
 SHEET_EQUIPMENT = "Техника"
 SHEET_DRIVER_MAP = "Водители техники"
 SHEET_SPECIAL_LAST = "Последние сведения спецтехники"
+SHEET_EQUIPMENT_LAST_PAIR = "Последний объект-заказчик"
 
 SPECIAL_EQUIPMENT = [
     ("Экскаватор-погрузчик", "CAT 434E №1", "3151 МК 50"),
@@ -99,6 +100,15 @@ SPECIAL_HEADERS = [
     "Пользователь Telegram",
     "Username Telegram",
     "Chat ID",
+]
+
+EQUIPMENT_LAST_PAIR_HEADERS = [
+    "Гос. номер",
+    "Наименование техники",
+    "Модель",
+    "Последний объект",
+    "Последний заказчик",
+    "Дата обновления",
 ]
 
 SPECIAL_LAST_HEADERS = [
@@ -2256,100 +2266,6 @@ def get_previous_special_report(
         return None
 
 
-async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """После выбора техники и даты предлагает повтор предыдущего отчёта."""
-    d = context.user_data
-
-    if d.get("category") != "special":
-        await ask_machine_driver(message, context)
-        return
-
-    previous = get_previous_special_report(
-        d["work_date"],
-        d["plate"],
-        d.get("model", ""),
-        d.get("name", ""),
-    )
-    d["previous_special"] = previous
-    d["step"] = "previous_special_offer"
-
-    machine_title = f"{d.get('model', '')} — {d.get('plate', '')}".strip(" —")
-
-    if previous:
-        text = (
-            f"{machine_title}\n"
-            f"Дата отчёта: {d['work_date']}\n\n"
-            f"Найден предыдущий отчёт за {previous['previous_date']}.\n\n"
-            f"Водитель: {previous['driver'] or '—'}\n"
-            f"Заказчик: {previous['customer'] or '—'}\n"
-            f"Объект: {previous['object'] or '—'}\n"
-            f"Начало: {previous['start']}\n"
-            f"Окончание: {previous['end']}\n"
-            f"Вид ставки: {previous['rate_type']}\n"
-            f"Ставка: {previous['rate']}\n"
-            f"Ставка за рейс: {previous['rate_trip']}\n"
-            f"Рейс: {previous['trips']}\n\n"
-            "Повторить эти сведения?"
-        )
-        rows = [
-            [InlineKeyboardButton(
-                f"🔁 Повторить сведения за {previous['previous_date']}",
-                callback_data="prevspecial|repeat",
-            )],
-            [InlineKeyboardButton(
-                "✍️ Заполнить новые сведения",
-                callback_data="prevspecial|new",
-            )],
-            [InlineKeyboardButton(
-                "⬅️ Назад к дате",
-                callback_data="reportback|0",
-            )],
-        ]
-    else:
-        text = (
-            f"{machine_title}\n"
-            f"Дата отчёта: {d['work_date']}\n\n"
-            "Более раннего отчёта по этой единице техники в листе "
-            "«Спецтехника» не найдено."
-        )
-        rows = [
-            [InlineKeyboardButton(
-                "✍️ Заполнить новые сведения",
-                callback_data="prevspecial|new",
-            )],
-            [InlineKeyboardButton(
-                "⬅️ Назад к дате",
-                callback_data="reportback|0",
-            )],
-        ]
-
-    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
-
-
-def apply_previous_special_report(d: dict[str, Any]) -> None:
-    """Копирует предыдущий отчёт в текущий, оставляя выбранную новую дату."""
-    previous = d["previous_special"]
-
-    d["driver"] = previous.get("driver", "")
-    d["customer"] = previous.get("customer", "")
-    d["object"] = previous.get("object", "")
-    d["start"] = previous.get("start", "-") or "-"
-    d["end"] = previous.get("end", "-") or "-"
-
-    # Рабочее время всё равно будет формулой в Google Sheets,
-    # но для предпросмотра считаем его здесь.
-    d["hours"] = work_hours(d["start"], d["end"])
-
-    d["rate_type"] = previous.get("rate_type", "-") or "-"
-    d["rate"] = previous_report_number(previous.get("rate", "-"))
-    d["rate_trip"] = previous_report_number(previous.get("rate_trip", "-"))
-    d["trips"] = previous_report_number(previous.get("trips", "-"))
-    d["note"] = previous.get("note", "")
-
-    d["amount"] = calc_special(d)
-
-
-
 async def ask_machine_driver(message, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     assigned = drivers_for_plate(d["plate"])
@@ -2817,6 +2733,141 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Действие отменено.", reply_markup=menu())
 
 
+def ensure_equipment_last_pair_sheet(sp):
+    """Служебный справочник последнего объекта и заказчика по каждой машине."""
+    ws = ensure_sheet(sp, SHEET_EQUIPMENT_LAST_PAIR, EQUIPMENT_LAST_PAIR_HEADERS, 100)
+    try:
+        ws.hide()
+    except Exception:
+        pass
+    return ws
+
+
+def save_last_object_customer(
+    plate: str,
+    name: str,
+    model: str,
+    object_name: str,
+    customer: str,
+) -> None:
+    """Запоминает последнюю пару объект/заказчик для конкретной единицы техники."""
+    if not plate:
+        return
+
+    try:
+        sp = book()
+        ws = ensure_equipment_last_pair_sheet(sp)
+        rows = ws.get_all_values()
+        target = normalize_plate(plate)
+
+        row_num = None
+        for n, row in enumerate(rows[1:], start=2):
+            if row and normalize_plate(row[0]) == target:
+                row_num = n
+                break
+
+        if row_num is None:
+            row_num = max(2, len(rows) + 1)
+
+        ws.update(
+            f"A{row_num}:F{row_num}",
+            [[
+                plate,
+                name,
+                model,
+                object_name,
+                customer,
+                datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            ]],
+            value_input_option="USER_ENTERED",
+        )
+        logger.info(
+            "Сохранены последние объект/заказчик: %s | %s | %s",
+            plate, object_name, customer,
+        )
+    except Exception:
+        logger.exception("Не удалось сохранить последний объект/заказчика для %s", plate)
+
+
+def get_last_object_customer(plate: str) -> tuple[str, str]:
+    """Возвращает последнюю сохранённую пару объект/заказчик для машины."""
+    if not plate:
+        return "", ""
+
+    try:
+        sp = book()
+        ws = ensure_equipment_last_pair_sheet(sp)
+        rows = ws.get_all_values()
+        target = normalize_plate(plate)
+
+        for row in rows[1:]:
+            if row and normalize_plate(row[0]) == target:
+                padded = row + [""] * max(0, 6 - len(row))
+                return str(padded[3]).strip(), str(padded[4]).strip()
+    except Exception:
+        logger.exception("Не удалось прочитать последний объект/заказчика для %s", plate)
+
+    return "", ""
+
+
+async def ask_special_object(message, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор объекта с быстрым использованием последнего объекта этой машины."""
+    d = context.user_data
+    last_object = d.get("last_object", "")
+
+    context.user_data["ref_next_step"] = "special_object"
+    context.user_data["ref_kind"] = "objects"
+    context.user_data["ref_include_none"] = False
+    context.user_data["step"] = "ref_choice"
+
+    rows = []
+    if last_object:
+        rows.append([
+            InlineKeyboardButton(
+                f"↩️ Последний объект: {last_object}"[:60],
+                callback_data="lastspecialobject|0",
+            )
+        ])
+
+    base = ref_search_keyboard("objects", include_none=False)
+    rows.extend([list(r) for r in base.inline_keyboard])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reportback|0")])
+
+    await message.reply_text(
+        "Выберите объект:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def ask_special_customer(message, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор заказчика с быстрым использованием последнего заказчика этой машины."""
+    d = context.user_data
+    last_customer = d.get("last_customer", "")
+
+    context.user_data["ref_next_step"] = "special_customer"
+    context.user_data["ref_kind"] = "customers"
+    context.user_data["ref_include_none"] = True
+    context.user_data["step"] = "ref_choice"
+
+    rows = []
+    if last_customer:
+        rows.append([
+            InlineKeyboardButton(
+                f"↩️ Последний заказчик: {last_customer}"[:60],
+                callback_data="lastspecialcustomer|0",
+            )
+        ])
+
+    base = ref_search_keyboard("customers", include_none=True)
+    rows.extend([list(r) for r in base.inline_keyboard])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="reportback|0")])
+
+    await message.reply_text(
+        "Выберите заказчика:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 async def begin_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data.update(flow="new", category="special", step="machine")
@@ -2894,9 +2945,9 @@ async def show_special_step_from_data(message, context: ContextTypes.DEFAULT_TYP
             reply_markup=back_markup(),
         )
     elif target == "object":
-        await ask_ref(message, context, "objects", "special_object")
+        await ask_special_object(message, context)
     elif target == "customer":
-        await ask_ref(message, context, "customers", "special_customer", include_none=True)
+        await ask_special_customer(message, context)
     elif target == "rate_type":
         d["step"] = "rate_type"
         await message.reply_text(
@@ -3029,7 +3080,7 @@ async def after_ref_selected(message, context: ContextTypes.DEFAULT_TYPE, kind: 
     elif kind == "objects":
         if d["category"] == "special":
             d["object"] = value
-            await ask_ref(message, context, "customers", "special_customer", include_none=True)
+            await ask_special_customer(message, context)
         else:
             d["current"] = {"object": value}
             await ask_ref(message, context, "customers", "dump_customer", include_none=True)
@@ -3073,117 +3124,41 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["work_date"] = datetime.now().strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
             if d.get("category") == "special":
-                await offer_previous_special_or_continue(q.message, context)
-            else:
-                await ask_machine_driver(q.message, context)
+                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+            await ask_machine_driver(q.message, context)
         elif choice == "1":
             d["work_date"] = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
             await q.edit_message_text(f"Дата выбрана: {d['work_date']}")
             if d.get("category") == "special":
-                await offer_previous_special_or_continue(q.message, context)
-            else:
-                await ask_machine_driver(q.message, context)
+                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+            await ask_machine_driver(q.message, context)
         else:
             d["step"] = "date_manual"
             await q.edit_message_text("Введите дату ДД.ММ.ГГГГ:", reply_markup=back_markup())
-    elif action == "prevspecial":
-        choice = parts[1]
 
-        if choice == "repeat":
-            try:
-                # Основной результат уже найден сразу после выбора даты.
-                # Если Telegram-контекст по какой-то причине потерян — читаем историю ещё раз.
-                previous = d.get("previous_special")
-                if previous is None:
-                    previous = get_previous_special_report(
-                        d.get("work_date", ""),
-                        d.get("plate", ""),
-                        d.get("model", ""),
-                        d.get("name", ""),
-                    )
+    elif action == "lastspecialobject":
+        last_object = d.get("last_object", "")
+        if not last_object:
+            await q.edit_message_text("Сохранённый объект не найден.")
+            await ask_special_object(q.message, context)
+            return
+        d["object"] = last_object
+        await q.edit_message_text(f"Объект: {last_object}")
+        await ask_special_customer(q.message, context)
 
-                if previous is None:
-                    d["previous_special"] = None
-                    d["step"] = "previous_special_offer"
-                    await q.edit_message_text(
-                        "❌ Предыдущие сведения по этой машине не удалось найти.\n\n"
-                        f"Техника: {d.get('model', '—')}\n"
-                        f"Гос. номер: {d.get('plate', '—')}\n"
-                        f"Дата нового отчёта: {d.get('work_date', '—')}\n\n"
-                        "Выберите «Заполнить новые сведения» или вернитесь к дате.",
-                        reply_markup=InlineKeyboardMarkup(
-                            [
-                                [
-                                    InlineKeyboardButton(
-                                        "✍️ Заполнить новые сведения",
-                                        callback_data="prevspecial|new",
-                                    )
-                                ],
-                                [
-                                    InlineKeyboardButton(
-                                        "⬅️ Назад к дате",
-                                        callback_data="reportback|0",
-                                    )
-                                ],
-                            ]
-                        ),
-                    )
-                    return
-
-                d["previous_special"] = previous
-                apply_previous_special_report(d)
-                d["step"] = "confirm"
-
-                loaded_text = (
-                    "✅ Предыдущие сведения загружены.\n\n"
-                    f"Источник: {previous.get('previous_date', 'предыдущий отчёт')}\n"
-                    f"Водитель: {d.get('driver') or '—'}\n"
-                    f"Заказчик: {d.get('customer') or '—'}\n"
-                    f"Объект: {d.get('object') or '—'}\n"
-                    f"Начало: {d.get('start', '—')}\n"
-                    f"Окончание: {d.get('end', '—')}\n"
-                    f"Вид ставки: {d.get('rate_type', '—')}\n"
-                    f"Ставка: {d.get('rate', '—')}\n"
-                    f"Ставка за рейс: {d.get('rate_trip', '—')}\n"
-                    f"Рейс: {d.get('trips', '—')}\n\n"
-                    "Проверьте сведения перед сохранением."
-                )
-
-                await q.edit_message_text(loaded_text)
-                await q.message.reply_text(
-                    summary(d),
-                    reply_markup=with_back(
-                        buttons(["Сохранить", "Отменить"], "confirm")
-                    ),
-                )
-
-            except Exception as exc:
-                logger.exception("Ошибка кнопки повторения предыдущих сведений")
-                d["step"] = "previous_special_offer"
-                await q.edit_message_text(
-                    "❌ При загрузке предыдущих сведений произошла ошибка.\n"
-                    f"{type(exc).__name__}: {exc}",
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "✍️ Заполнить новые сведения",
-                                    callback_data="prevspecial|new",
-                                )
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "⬅️ Назад к дате",
-                                    callback_data="reportback|0",
-                                )
-                            ],
-                        ]
-                    ),
-                )
-        else:
-            d.pop("previous_special", None)
-            await q.edit_message_text("Заполняем сведения заново.")
-            await ask_machine_driver(q.message, context)
+    elif action == "lastspecialcustomer":
+        last_customer = d.get("last_customer", "")
+        if not last_customer:
+            await q.edit_message_text("Сохранённый заказчик не найден.")
+            await ask_special_customer(q.message, context)
+            return
+        d["customer"] = last_customer
+        d["step"] = "rate_type"
+        await q.edit_message_text(f"Заказчик: {last_customer}")
+        await q.message.reply_text(
+            "Выберите вид ставки:",
+            reply_markup=buttons(RATE_TYPES, "ratetype"),
+        )
 
     elif action == "machdriver":
         assigned = drivers_for_plate(d["plate"])
@@ -3393,9 +3368,8 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             datetime.strptime(value, "%d.%m.%Y")
             d["work_date"] = value
             if d.get("category") == "special":
-                await offer_previous_special_or_continue(update.message, context)
-            else:
-                await ask_machine_driver(update.message, context)
+                d["last_object"], d["last_customer"] = get_last_object_customer(d.get("plate", ""))
+            await ask_machine_driver(update.message, context)
         elif step == "add_machine_driver":
             ok, result = add_driver_for_plate(d["model"], d["plate"], value)
             if not ok:
@@ -3425,7 +3399,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["end"] = value
             d["hours"] = work_hours(d["start"], value)
             if d["category"] == "special":
-                await ask_ref(update.message, context, "objects", "special_object")
+                await ask_special_object(update.message, context)
             else:
                 d["step"] = "object_count"
                 await update.message.reply_text(
@@ -3636,6 +3610,13 @@ async def save_current_report(q, context):
             update_special_last_cache(special.spreadsheet, d)
         except Exception:
             logger.exception("Не удалось обновить кэш последнего отчёта")
+        save_last_object_customer(
+            d.get("plate", ""),
+            d.get("name", ""),
+            d.get("model", ""),
+            d.get("object", ""),
+            d.get("customer", ""),
+        )
         tab = SHEET_SPECIAL
     else:
         row = [
