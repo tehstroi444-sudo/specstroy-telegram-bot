@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "6.6.4-previous-cache-lastrow-links"
+BOT_VERSION = "6.6.5-repeat-previous-rebuilt"
 TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
@@ -2138,133 +2138,159 @@ def get_previous_special_report(
     model: str = "",
     equipment_name: str = "",
 ) -> dict[str, Any] | None:
-    """Ищет предыдущие сведения по технике во вкладке Спецтехника.
+    """Находит предыдущий отчёт выбранной единицы Спецтехники.
 
-    Использует названия колонок из первой строки, а не жёсткие номера столбцов.
-    Поэтому поиск продолжает работать после перестановок/изменений структуры таблицы.
+    ВАЖНО: функция не вызывает initialize_sheets(), поэтому поиск не зависит
+    от оформления листа, фильтров, формул и лимитов лишних Write-запросов.
+
+    Приоритет:
+    1) эта же машина за предыдущий календарный день;
+    2) последний более ранний отчёт этой же машины.
     """
     try:
         selected_date = datetime.strptime(work_date, "%d.%m.%Y").date()
         yesterday = selected_date - timedelta(days=1)
 
-        special, _, _, _ = initialize_sheets()
+        sp = book()
+        special = sp.worksheet(SHEET_SPECIAL)
         rows = special.get_all_values()
 
         if len(rows) < 2:
-            cache_ws = ensure_special_last_sheet(special.spreadsheet)
-            rebuild_special_last_cache_if_empty(special, cache_ws)
-            return get_previous_from_cache(special.spreadsheet, work_date, plate)
+            return None
 
+        # Индексы ищем по реальным названиям колонок.
         headers = [normalize(str(x)) for x in rows[0]]
-        header_index = {name: i for i, name in enumerate(headers) if name}
+        idx = {h: i for i, h in enumerate(headers) if h}
 
-        def col(*names, fallback=None):
+        def find_col(*names, fallback=None):
             for name in names:
                 key = normalize(name)
-                if key in header_index:
-                    return header_index[key]
+                if key in idx:
+                    return idx[key]
             return fallback
 
-        idx_date = col("Дата работы", fallback=0)
-        idx_name = col("Наименование техники", fallback=1)
-        idx_model = col("Модель", fallback=2)
-        idx_plate = col("Гос. номер", "Гос номер", fallback=3)
-        idx_driver = col("Машинист / водитель", "Водитель", fallback=4)
-        idx_customer = col("Заказчик", fallback=5)
-        idx_object = col("Объект", fallback=6)
-        idx_start = col("Начало", fallback=7)
-        idx_end = col("Окончание", fallback=8)
-        idx_rate_type = col("Вид ставки", fallback=10)
-        idx_rate = col("Ставка, ₽", "Ставка", fallback=11)
-        idx_rate_trip = col("Ставка за рейс, ₽", "Ставка за рейс", fallback=12)
-        idx_trips = col("Рейс", "Рейсы", fallback=13)
-        idx_note = col("Примечание", fallback=15)
+        columns = {
+            "date": find_col("Дата работы", fallback=0),
+            "name": find_col("Наименование техники", fallback=1),
+            "model": find_col("Модель", fallback=2),
+            "plate": find_col("Гос. номер", "Гос номер", fallback=3),
+            "driver": find_col("Машинист / водитель", "Водитель", fallback=4),
+            "customer": find_col("Заказчик", fallback=5),
+            "object": find_col("Объект", fallback=6),
+            "start": find_col("Начало", fallback=7),
+            "end": find_col("Окончание", fallback=8),
+            "rate_type": find_col("Вид ставки", fallback=10),
+            "rate": find_col("Ставка, ₽", "Ставка", fallback=11),
+            "rate_trip": find_col("Ставка за рейс, ₽", "Ставка за рейс", fallback=12),
+            "trips": find_col("Рейс", "Рейсы", fallback=13),
+            "note": find_col("Примечание", fallback=15),
+        }
 
-        def get(row, idx):
-            return row[idx] if idx is not None and idx < len(row) else ""
+        def get(row, key):
+            i = columns[key]
+            return row[i] if i is not None and i < len(row) else ""
 
         target_plate = normalize_plate(plate)
         target_model = normalize(model)
         target_name = normalize(equipment_name)
 
-        exact_plate = []
-        fallback_matches = []
+        matches = []
 
+        # Идём по всем строкам, но не требуем идеального формата даты для
+        # определения самой машины.
         for row_num, row in enumerate(rows[1:], start=2):
-            row_date = parse_sheet_date(get(row, idx_date))
-            if row_date is None or row_date >= selected_date:
-                continue
+            row_plate = str(get(row, "plate")).strip()
+            row_model = str(get(row, "model")).strip()
+            row_name = str(get(row, "name")).strip()
 
-            row_plate = str(get(row, idx_plate)).strip()
-            row_model = str(get(row, idx_model)).strip()
-            row_name = str(get(row, idx_name)).strip()
-
-            plate_match = bool(target_plate) and normalize_plate(row_plate) == target_plate
-            model_match = bool(target_model) and normalize(row_model) == target_model
-            name_model_match = (
+            same_plate = bool(target_plate) and normalize_plate(row_plate) == target_plate
+            same_model = bool(target_model) and normalize(row_model) == target_model
+            same_name_model = (
                 bool(target_name)
                 and bool(target_model)
                 and normalize(row_name) == target_name
                 and normalize(row_model) == target_model
             )
 
-            item = (row_date, row_num, row)
+            if not (same_plate or same_model or same_name_model):
+                continue
 
-            if plate_match:
-                exact_plate.append(item)
-            elif model_match or name_model_match:
-                fallback_matches.append(item)
+            row_date = parse_sheet_date(get(row, "date"))
 
-        candidates = exact_plate if exact_plate else fallback_matches
-        if not candidates:
+            # Не берём текущую/будущую запись, если дата распознана.
+            if row_date is not None and row_date >= selected_date:
+                continue
+
+            # Совпадение по номеру имеет больший вес.
+            matches.append((row_num, row, row_date, same_plate))
+
+        if not matches:
             logger.info(
-                "Нет предыдущих записей в основной таблице: plate=%r model=%r name=%r, rows=%s",
-                plate, model, equipment_name, len(rows) - 1,
+                "Предыдущая информация не найдена: plate=%r model=%r name=%r",
+                plate, model, equipment_name,
             )
-            cache_ws = ensure_special_last_sheet(special.spreadsheet)
-            rebuild_special_last_cache_if_empty(special, cache_ws)
-            return get_previous_from_cache(special.spreadsheet, work_date, plate)
+            return None
 
-        # Сначала строго вчера; если вчера записи нет — последний более ранний отчёт.
-        yesterday_candidates = [x for x in candidates if x[0] == yesterday]
-        if yesterday_candidates:
-            report_date, row_num, row = max(yesterday_candidates, key=lambda x: x[1])
+        # 1. Строго предыдущий день.
+        yesterday_matches = [x for x in matches if x[2] == yesterday]
+        if yesterday_matches:
+            row_num, row, row_date, _ = max(
+                yesterday_matches,
+                key=lambda x: (x[3], x[0]),
+            )
             is_yesterday = True
         else:
-            report_date, row_num, row = max(candidates, key=lambda x: (x[0], x[1]))
+            # 2. Если вчера записи нет, берём последнюю более раннюю.
+            # Если дата старой строки не распознана, считаем номер строки:
+            # отчёты добавляются вниз, поэтому нижняя строка новее.
+            dated = [x for x in matches if x[2] is not None]
+            if dated:
+                row_num, row, row_date, _ = max(
+                    dated,
+                    key=lambda x: (x[2], x[3], x[0]),
+                )
+            else:
+                row_num, row, row_date, _ = max(matches, key=lambda x: (x[3], x[0]))
             is_yesterday = False
 
-        logger.info(
-            "Найден предыдущий отчёт: row=%s date=%s plate=%r model=%r",
-            row_num, report_date, get(row, idx_plate), get(row, idx_model),
+        previous_date = (
+            row_date.strftime("%d.%m.%Y")
+            if row_date is not None
+            else str(get(row, "date")).strip() or "предыдущая запись"
         )
 
-        return {
-            "previous_date": report_date.strftime("%d.%m.%Y"),
+        result = {
+            "previous_date": previous_date,
             "is_yesterday": is_yesterday,
-            "driver": str(get(row, idx_driver)).strip(),
-            "customer": str(get(row, idx_customer)).strip(),
-            "object": str(get(row, idx_object)).strip(),
-            "start": str(get(row, idx_start)).strip() or "-",
-            "end": str(get(row, idx_end)).strip() or "-",
-            "rate_type": str(get(row, idx_rate_type)).strip() or "-",
-            "rate": previous_report_number(get(row, idx_rate)),
-            "rate_trip": previous_report_number(get(row, idx_rate_trip)),
-            "trips": previous_report_number(get(row, idx_trips)),
-            "note": str(get(row, idx_note)).strip(),
+            "driver": str(get(row, "driver")).strip(),
+            "customer": str(get(row, "customer")).strip(),
+            "object": str(get(row, "object")).strip(),
+            "start": str(get(row, "start")).strip() or "-",
+            "end": str(get(row, "end")).strip() or "-",
+            "rate_type": str(get(row, "rate_type")).strip() or "-",
+            "rate": previous_report_number(get(row, "rate")),
+            "rate_trip": previous_report_number(get(row, "rate_trip")),
+            "trips": previous_report_number(get(row, "trips")),
+            "note": str(get(row, "note")).strip(),
             "source_row": row_num,
         }
 
+        logger.info(
+            "Предыдущая информация найдена: plate=%s row=%s date=%s",
+            plate, row_num, previous_date,
+        )
+        return result
+
     except Exception:
         logger.exception(
-            "Ошибка поиска предыдущих сведений: date=%s plate=%s model=%s",
+            "Ошибка прямого поиска предыдущего отчёта: date=%s plate=%s model=%s",
             work_date, plate, model,
         )
         return None
 
 
 async def offer_previous_special_or_continue(message, context: ContextTypes.DEFAULT_TYPE):
-    """После выбора техники и даты предлагает прошлые сведения или новое заполнение."""
+    """После техники и даты всегда предлагает повторить сведения или заполнить новые."""
     d = context.user_data
 
     if d.get("category") != "special":
@@ -2285,17 +2311,14 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
 
     if previous:
         if previous.get("is_yesterday"):
-            found_line = f"Сведения за предыдущий день ({previous['previous_date']}) найдены."
+            info_line = f"Найдены сведения за предыдущий день: {previous['previous_date']}."
         else:
-            found_line = (
-                f"За предыдущий день записи нет. "
-                f"Найдены последние сведения за {previous['previous_date']}."
-            )
+            info_line = f"Найдены последние предыдущие сведения: {previous['previous_date']}."
 
         text = (
             f"{machine_title}\n"
             f"Дата отчёта: {d['work_date']}\n\n"
-            f"{found_line}\n\n"
+            f"{info_line}\n\n"
             f"Водитель: {previous['driver'] or '—'}\n"
             f"Заказчик: {previous['customer'] or '—'}\n"
             f"Объект: {previous['object'] or '—'}\n"
@@ -2304,54 +2327,39 @@ async def offer_previous_special_or_continue(message, context: ContextTypes.DEFA
             f"Ставка: {previous['rate']}\n"
             f"Ставка за рейс: {previous['rate_trip']}\n"
             f"Рейс: {previous['trips']}\n\n"
-            "Как заполнить отчёт?"
-        )
-
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        f"🔁 Взять сведения за {previous['previous_date']}",
-                        callback_data="prevspecial|repeat",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✍️ Заполнить новые сведения",
-                        callback_data="prevspecial|new",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад к дате",
-                        callback_data="reportback|0",
-                    )
-                ],
-            ]
+            "Выберите действие:"
         )
     else:
         text = (
             f"{machine_title}\n"
             f"Дата отчёта: {d['work_date']}\n\n"
-            "Предыдущие сведения по этой технике в таблице не найдены.\n\n"
-            "Заполните новые сведения."
+            "Сохранённые предыдущие сведения по этой машине не найдены.\n\n"
+            "Выберите действие:"
         )
-        keyboard = InlineKeyboardMarkup(
+
+    # Кнопка повторения присутствует ВСЕГДА.
+    keyboard = InlineKeyboardMarkup(
+        [
             [
-                [
-                    InlineKeyboardButton(
-                        "✍️ Заполнить новые сведения",
-                        callback_data="prevspecial|new",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⬅️ Назад к дате",
-                        callback_data="reportback|0",
-                    )
-                ],
-            ]
-        )
+                InlineKeyboardButton(
+                    "🔁 Повторить предыдущие сведения",
+                    callback_data="prevspecial|repeat",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✍️ Заполнить новые сведения",
+                    callback_data="prevspecial|new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад к дате",
+                    callback_data="reportback|0",
+                )
+            ],
+        ]
+    )
 
     await message.reply_text(text, reply_markup=keyboard)
 
@@ -2829,35 +2837,6 @@ async def filters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def lastrows_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        special, dump, _, _ = initialize_sheets()
-        sp = special.spreadsheet
-        s_row = last_filled_row(special)
-        d_row = last_filled_row(dump)
-
-        await update.effective_message.reply_text(
-            "Открыть таблицу на последней заполненной строке:",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton(
-                        f"🚜 Спецтехника — строка {s_row}",
-                        url=sheet_row_url(sp, special, s_row),
-                    )],
-                    [InlineKeyboardButton(
-                        f"🚛 Самосвалы — строка {d_row}",
-                        url=sheet_row_url(sp, dump, d_row),
-                    )],
-                ]
-            ),
-        )
-    except Exception as exc:
-        logger.exception("Ошибка перехода к последним строкам")
-        await update.effective_message.reply_text(
-            f"❌ Не удалось получить последние строки: {type(exc).__name__}: {exc}"
-        )
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     initialize_sheets()
@@ -3152,10 +3131,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 previous = d.get("previous_special")
                 if not previous:
-                    await q.edit_message_text(
-                        "Для этой единицы техники предыдущий отчёт не найден. Заполните сведения заново."
+                    await q.answer(
+                        "Предыдущие сведения по этой машине пока не найдены.",
+                        show_alert=True,
                     )
-                    await ask_machine_driver(q.message, context)
                     return
 
                 apply_previous_special_report(d)
@@ -3686,13 +3665,8 @@ async def save_current_report(q, context):
         for col, formula in formulas.items():
             dump.update_cell(row_num, col, formula)
         tab = SHEET_DUMP
-    ws = special if d["category"] == "special" else dump
-    row_link = sheet_row_url(ws.spreadsheet, ws, row_num)
     await q.edit_message_text(
-        f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📍 Открыть последнюю строку", url=row_link)]]
-        ),
+        f"✅ Сохранено. Вкладка: {tab}. Строка: {row_num}"
     )
     await q.message.reply_text("Выберите действие:", reply_markup=menu())
     context.user_data.clear()
@@ -3846,7 +3820,6 @@ def build():
     app.add_handler(CommandHandler("new", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("version", version))
-    app.add_handler(CommandHandler("lastrows", lastrows_command))
     app.add_handler(CommandHandler("filters", filters_command))
     app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("syncdocs", sync_documents_command))
